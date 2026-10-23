@@ -20,6 +20,10 @@ on:
         description: "SDL3 源码版本（官方夜版用 crueter-ci/SDL3 3.4.14，这里默认对齐 3.4.14）"
         required: false
         default: "3.4.14"
+      compiler:
+        description: "编译器：clang-cl（官方 Windows 版用的，默认）或 msvc"
+        required: false
+        default: "clang-cl"
 
 jobs:
   build:
@@ -72,14 +76,16 @@ jobs:
           Write-Host "commit = $commit / ref = $branch"
           git -C eden log -1 --format="%ad | %s" --date=short
 
-      - name: 降级 Eden 的「MSVC 警告即错误」开关
+      - name: 降级 Eden 的「MSVC 警告即错误」开关（仅 msvc 模式需要）
+        if: ${{ github.event.inputs.compiler == 'msvc' }}
         shell: pwsh
         run: |
           # Eden 在 8 个 CMakeLists.txt 里给 MSVC 打开了一批 /we####（把指定警告当错误），
           # 共 43 处。这些开关是目录级的，对以 #include 方式编进来的第三方代码同样生效：
           #   - src/common 的 zbic_compression.cpp 直接 include zstd 合并版 → 175 个 C4505
           #   - src/core 的 launch_params.cpp 触发 C4800（int→bool 隐式转换）
-          # 官方只用 clang 构建，clang 没有这套 /we，所以上游永远碰不到。
+          # 注意：这些开关只在 `if (MSVC AND NOT CXX_CLANG)` 里添加，所以 clang-cl 模式根本不会
+          # 出现这两类错误，本步骤在 clang-cl 下会被跳过。
           # 这里统一改成 /wd####（直接关掉该警告），只影响诊断级别，不改任何代码行为。
           # 注意不能用 /w####：MSVC 会把它解析成 "/w4 + 数字"，报 D9014 并忽略，等于没生效。
           $files = Get-ChildItem -Path "eden" -Recurse -File -Include "CMakeLists.txt","*.cmake" -ErrorAction SilentlyContinue |
@@ -136,6 +142,39 @@ jobs:
           Write-Host "cl.exe = $($cl.Source)"
           $global:LASTEXITCODE = 0
 
+      - name: 准备 clang-cl
+        if: ${{ github.event.inputs.compiler != 'msvc' }}
+        shell: pwsh
+        run: |
+          # clang-cl = clang 前端 + MSVC ABI。Eden 官方 Windows 版就用它：
+          #   - CMakeLists.txt 里有 `if (MSVC AND CXX_CLANG)` 分支，专门链接他们自己托管的
+          #     libclang_rt.builtins-x86_64.a（eden-emu/llvm-mingw 仓库），并为 opus 加 -Wno-implicit-function-declaration
+          #   - `if (MSVC AND NOT CXX_CLANG)` 才加 /we#### /W3 /WX-，所以 clang-cl 天生没有“警告即错误”问题
+          # 它仍然用 MSVC 工具链（link.exe、Windows SDK、UCRT），因此 MSVC 版的 Qt/ffmpeg/Vulkan 全部可直接复用。
+          $candidates = @(
+            "C:\Program Files\LLVM\bin\clang-cl.exe",
+            "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin\clang-cl.exe",
+            "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\bin\clang-cl.exe"
+          )
+          $clang = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $clang) {
+            $cmd = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $clang = $cmd.Source }
+          }
+          if (-not $clang) { throw "runner 上找不到 clang-cl.exe（windows-2022 镜像自带 LLVM）" }
+
+          $ver = (& $clang --version 2>&1 | Out-String).Trim()
+          Write-Host "clang-cl = $clang"
+          Write-Host $ver
+
+          $dir = Split-Path $clang -Parent
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          Add-Content -Path $env:GITHUB_ENV  -Value "CC=$clang"
+          Add-Content -Path $env:GITHUB_ENV  -Value "CXX=$clang"
+          $env:CC = $clang
+          $env:CXX = $clang
+          $global:LASTEXITCODE = 0
+
       - name: 安装 Vulkan SDK
         # Eden 的脚本用了 PS7 已移除的 Get-WmiObject，必须走 Windows PowerShell 5.1
         shell: powershell
@@ -178,6 +217,10 @@ jobs:
         shell: pwsh
         run: |
           $root = (Get-Location).Path -replace '\\','/'
+          $compiler = "${{ github.event.inputs.compiler }}"
+          if ([string]::IsNullOrWhiteSpace($compiler)) { $compiler = "clang-cl" }
+          Write-Host "编译器模式：$compiler"
+
           $cmakeArgs = @(
             "-S","eden","-B","build","-G","Ninja",
             "-DCMAKE_BUILD_TYPE=Release",
@@ -189,6 +232,9 @@ jobs:
             "-DSDL_SHARED=OFF","-DSDL_STATIC=ON",
             "-DSDL_TESTS=OFF","-DSDL_TEST_LIBRARY=OFF"
           )
+          if ($compiler -ne "msvc") {
+            $cmakeArgs += @("-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
+          }
           $log = Join-Path $PWD "configure.log"
 
           # ENABLE_QT_TRANSLATION 默认 OFF，关掉后 dist/languages/*.ts 不参与编译，
@@ -211,6 +257,17 @@ jobs:
             if (Test-Path build/CMakeFiles/CMakeError.log) { Get-Content build/CMakeFiles/CMakeError.log -Tail 100 }
             if (Test-Path build/CMakeFiles/CMakeOutput.log) { Get-Content build/CMakeFiles/CMakeOutput.log -Tail 40 }
             throw "Eden 配置失败"
+          }
+
+          # 自检：编译器是不是真的切过去了（clang-cl 会显示 "Clang ... with MSVC-like command-line"）
+          $idline = Select-String -Path $log -Pattern "The CXX compiler identification is" | Select-Object -First 1
+          if ($idline) { Write-Host $idline.Line.Trim() }
+          if ($compiler -ne "msvc") {
+            if ($idline -and $idline.Line -match "Clang") {
+              Write-Host "确认：正在用 clang-cl 构建"
+            } elseif ($idline) {
+              Write-Host "警告：期望 clang-cl，但实际识别为 $($idline.Line.Trim())"
+            }
           }
 
           # 自检：确认真的用了我们修补后的 SDL3 源码目录
