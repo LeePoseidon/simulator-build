@@ -1,0 +1,431 @@
+name: Build Eden Nightly (MSVC)
+
+# 上传到仓库的 .github/workflows/build-nightly-msvc.yml
+# 用法：Actions -> 左侧 "Build Eden Nightly (MSVC)" -> Run workflow
+# 产物：Artifacts -> eden-nightly-msvc-beitong-fix
+#
+# 【这条路线是什么】
+#   夜版 = master 分支。master 已从 SDL2 迁到 SDL3，所以用 SDL3 版补丁。
+#   编译器是纯 MSVC（cl.exe）。官方 Windows 版走的是 clang-cl，所以这条路是在替上游
+#   做 MSVC 适配，历史上踩过的坑全部固化在下面（编号见注释）：
+#     坑位2  C2440  reinterpret_cast<u64>(ULONG_PTR)      → 0002 补丁改 static_cast
+#     坑位3  /we#### 目录级生效，把第三方代码的警告变错误 → 递归降级为 /wd####
+#     坑位4  /w#### 不是合法写法，会被 D9014 忽略         → 只用 /wd####
+#
+# 【与 build-nightly-clangcl.yml 的关系】
+#   两条路线互相独立、可同时存在、产物名不同，方便 A/B 对比。
+#   如果只是想拿到能用的夜版，优先试 clang-cl 那条；本文件适合需要纯 MSVC 产物的场景。
+
+on:
+  workflow_dispatch:
+    inputs:
+      eden_ref:
+        description: "Eden 的 tag/分支/提交（默认 master = 夜版）"
+        required: false
+        default: "master"
+      sdl_version:
+        description: "SDL3 源码版本（官方夜版对齐 3.4.14）"
+        required: false
+        default: "3.4.14"
+
+concurrency:
+  group: nightly-msvc-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Windows x64 (nightly / MSVC)
+    # 同样必须 windows-2025：夜版 Qt 6.11.1 是用 VS 2026 的 STL 编的，会引用
+    # __std_rotate / __std_unique_4 等新符号；VS 2022 的库里没有，链接必然失败。
+    # 这一点与编译器选择无关——纯 MSVC 也一样要找这些符号。
+    runs-on: windows-2025
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout（只为拿到补丁文件）
+        uses: actions/checkout@v5
+
+      - name: 前置检查：补丁文件是否齐全
+        shell: pwsh
+        run: |
+          $need = @(
+            "patches/0001-sdl3-switch-imu-calibration-fallback.patch",
+            "patches/0002-eden-msvc-static-cast.patch"
+          )
+          foreach ($p in $need) {
+            if (-not (Test-Path $p)) { throw "缺少补丁文件：$p（请先上传到仓库对应路径）" }
+            Write-Host ("OK  {0}  {1} 字节" -f $p, (Get-Item $p).Length)
+          }
+
+      - name: 克隆 Eden 源码并应用补丁
+        shell: pwsh
+        run: |
+          $ref = "${{ github.event.inputs.eden_ref }}"
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "master" }
+          Write-Host "Eden ref = $ref"
+
+          git clone --depth 1 --branch $ref https://git.eden-emu.dev/eden-emu/eden.git eden
+          if ($LASTEXITCODE -ne 0) { throw "克隆 Eden 失败：$ref" }
+
+          # ── 坑位 2：C2440 ──
+          # ExceptionInformation[] 的类型是 ULONG_PTR。MSVC 把 unsigned __int64 与
+          # unsigned long long 当作不同类型，reinterpret_cast 非法。改成 static_cast。
+          $edenPatches = Get-ChildItem -Path "patches" -Filter "0002-eden-msvc-*.patch" -ErrorAction SilentlyContinue
+          if (-not $edenPatches) { throw "没找到 0002-eden-msvc-*.patch" }
+          foreach ($p in $edenPatches) {
+            Write-Host "应用 Eden 补丁：$($p.Name)"
+            git -c core.autocrlf=false -C eden apply --verbose $p.FullName
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "首次应用失败，改用 --ignore-whitespace 重试"
+              git -c core.autocrlf=false -C eden apply --ignore-whitespace --verbose $p.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Eden 补丁应用失败：$($p.Name)（master 该行可能改过，需重新对位）" }
+            }
+          }
+          if (-not (Select-String -Path "eden/src/common/sparse_large_vector.cpp" -Pattern "static_cast<u64>" -Quiet)) {
+            throw "Eden 补丁未生效：sparse_large_vector.cpp 里找不到 static_cast<u64>"
+          }
+          if (Select-String -Path "eden/src/common/sparse_large_vector.cpp" -Pattern "reinterpret_cast<u64>\(info->ExceptionRecord" -Quiet) {
+            throw "Eden 补丁未生效：旧的 reinterpret_cast<u64> 仍在"
+          }
+          Write-Host "Eden 补丁已生效"
+
+          $commit = (git -C eden rev-parse HEAD).Trim()
+          $branch = (git -C eden rev-parse --abbrev-ref HEAD).Trim()
+          if ($branch -eq "HEAD") { $branch = $ref }
+
+          # GetSCMRev 会优先读这三个文件，写进去就不用整仓库完整历史（223MB）
+          Set-Content -Path eden/GIT-COMMIT  -Value $commit -NoNewline -Encoding ascii
+          Set-Content -Path eden/GIT-REFSPEC -Value $branch -NoNewline -Encoding ascii
+          Set-Content -Path eden/GIT-TAG     -Value $branch -NoNewline -Encoding ascii
+
+          Write-Host "commit = $commit / ref = $branch"
+          git -C eden log -1 --format="%ad | %s" --date=short
+
+      # ── 坑位 3 + 坑位 4：把 Eden 的「警告即错误」开关降级 ──
+      # Eden 在 8 个 CMakeLists.txt 里给 MSVC 开了一批 /we####（共 43 处），并且是
+      # `if (MSVC AND NOT CXX_CLANG)` 内、用 add_compile_options 加的目录级选项，
+      # 对以 #include 方式编进来的第三方代码同样生效：
+      #   - src/common/zbic_compression.cpp include 了 zstd 单文件合并版 → 175 个 C4505
+      #   - src/core/launch_params.cpp 触发 C4800（int → bool 隐式转换）
+      # 统一改成 /wd####（直接关闭该警告）。
+      # 不能用 /w####：MSVC 会把它解析成 "/w4 + 数字"，报 D9014 后忽略，等于没改，还刷日志。
+      - name: 降级 Eden 的「MSVC 警告即错误」开关（/we#### → /wd####）
+        shell: pwsh
+        run: |
+          # ── 坑位 4：不能用 /w####。MSVC 的 /w 选项是「/w + 级别(0~4) + 警告号」，
+          #    /w4505 会被解析成 "/w4 + 505"，报 D9014 后直接忽略——等于没改，还刷一堆日志。
+          #    注意上游自己也有 7 处 /w4426、/w4445 这种写法（同样被忽略，但一直没人管），
+          #    所以这里不能要求「非法写法为 0」，只能要求「处理后不得新增」。 ──
+          $files = Get-ChildItem -Path "eden" -Recurse -File -Include "CMakeLists.txt","*.cmake" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -notmatch '\\\.git\\|\\\.cache\\' }
+          if (-not $files) { throw "在 eden 目录下没扫到任何 CMakeLists.txt / *.cmake" }
+          Write-Host "扫描到 $($files.Count) 个 CMake 文件"
+
+          $total = 0
+          $badBefore = 0
+          foreach ($f in $files) {
+            $text = Get-Content $f.FullName -Raw
+            $badBefore += ([regex]::Matches($text, '/w(?!d|e)\d{4}')).Count
+            if ($text -notmatch '/we\d{4}') { continue }
+            $hit = ([regex]::Matches($text, '/we\d{4}')).Count
+            $new = [regex]::Replace($text, '/we(\d{4})', '/wd$1')
+            [IO.File]::WriteAllText($f.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
+            $total += $hit
+            Write-Host ("  {0,-46} {1} 处" -f $f.FullName.Replace((Get-Location).Path + '\',''), $hit)
+          }
+          Write-Host "合计降级 $total 处：/we#### -> /wd####"
+          if ($total -lt 30) { throw "只找到 $total 处 /we####（预期 ≥30），Eden 的 CMake 结构可能改过，需重新确认" }
+
+          # 二次扫描：/we#### 残留必须为 0（漏一个就会在编译时报红）；
+          # 非法写法 /w#### 不得比处理前多（多了说明我们的替换写错了）
+          $left = 0
+          $badAfter = 0
+          foreach ($f in $files) {
+            $t = Get-Content $f.FullName -Raw
+            $left += ([regex]::Matches($t, '/we\d{4}')).Count
+            $badAfter += ([regex]::Matches($t, '/w(?!d|e)\d{4}')).Count
+          }
+          Write-Host "残留 /we####：$left 处"
+          Write-Host "非法写法 /w####：处理前 $badBefore 处 -> 处理后 $badAfter 处（上游既有，保持不增）"
+          if ($left -ne 0) { throw "仍有 $left 处 /we#### 未降级" }
+          if ($badAfter -gt $badBefore) { throw "替换引入了 $($badAfter - $badBefore) 处非法写法 /w####（应为 /wd####）" }
+
+          Write-Host "抽查落位情况："
+          Select-String -Path "eden/src/CMakeLists.txt","eden/src/core/CMakeLists.txt" -Pattern '/wd4505|/wd4800|/wd4189' |
+            ForEach-Object { Write-Host ("  " + $_.Filename + ": " + $_.Line.Trim()) }
+
+      # ── 坑位 5：ilammy/msvc-dev-cmd@v1 运行时是 node20，已被 GitHub 弃用 ──
+      - name: 加载 MSVC x64 环境
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "找不到 vswhere.exe，runner 镜像可能变了" }
+          $vsPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $vsPath) { throw "找不到含 C++ 工具的 Visual Studio" }
+
+          # ── 坑位 10：必须确认拿到 VS 2026（STL 14.50+）──
+          Write-Host "Visual Studio 安装路径：$vsPath"
+          $ver = (& $vswhere -latest -products * -property catalog_productDisplayVersion | Out-String).Trim()
+          Write-Host "Visual Studio 版本：$ver"
+          if ($vsPath -match '\\2022\\') {
+            Write-Host "::warning title=VS 版本偏旧::检测到 Visual Studio 2022；夜版 Qt 6.11.1 需要 VS 2026 的 STL，链接大概率会缺 __std_* 符号"
+          }
+
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "找不到 vcvars64.bat：$vcvars" }
+          Write-Host "vcvars: $vcvars"
+
+          $lines = cmd /c "call `"$vcvars`" >nul 2>&1 && set"
+          $n = 0
+          foreach ($line in $lines) {
+            $i = $line.IndexOf('=')
+            if ($i -lt 1) { continue }        # 跳过 "=C:=..." 这类当前目录伪变量
+            $k = $line.Substring(0, $i)
+            $v = $line.Substring($i + 1)
+            Set-Item -Path "Env:$k" -Value $v -Force
+            Add-Content -Path $env:GITHUB_ENV -Value "$k=$v"
+            $n++
+          }
+          if ($n -lt 20) { throw "vcvars 环境变量导入异常，只有 $n 条" }
+          Write-Host "已导入 $n 个环境变量"
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          if (-not $cl) { throw "导入环境后仍找不到 cl.exe" }
+          Write-Host "cl.exe = $($cl.Source)"
+          # 打印具体版本，便于判断是不是 VS 2026 工具链
+          $clVer = (& cl 2>&1 | Out-String)
+          if ($clVer -match 'Version\s+([0-9.]+)') { Write-Host "cl.exe 版本：$($Matches[1])" }
+          $global:LASTEXITCODE = 0
+
+      # ── 坑位 6：Eden 的脚本用了 PowerShell 7 已移除的 Get-WmiObject，必须走 5.1 ──
+      - name: 安装 Vulkan SDK
+        shell: powershell
+        run: |
+          Push-Location eden
+          try {
+            ./tools/windows/install-vulkan-sdk.ps1
+          } finally {
+            Pop-Location
+          }
+          # 脚本提前 return 时 $LASTEXITCODE 可能是 $null，不能用 -ne 0 判断
+          if ($LASTEXITCODE) { throw "Vulkan SDK 安装失败（exit $LASTEXITCODE）" }
+          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+
+      # ── 坑位 1：SDL3 的 LoadIMUCalibration 对全 0 标定数据没有兜底 ──
+      - name: 下载并修补 SDL3 源码
+        shell: pwsh
+        run: |
+          $ver = "${{ github.event.inputs.sdl_version }}"
+          if ([string]::IsNullOrWhiteSpace($ver)) { $ver = "3.4.14" }
+          Write-Host "SDL3 version = $ver"
+
+          # ── 坑位 8：runner 全局 core.autocrlf 可能为 true，源码会被检出成 CRLF，LF 补丁打不上 ──
+          git -c core.autocrlf=false -c core.eol=lf clone --depth 1 --branch "release-$ver" https://github.com/libsdl-org/SDL.git sdl3
+          if ($LASTEXITCODE -ne 0) { throw "克隆 SDL3 失败：release-$ver" }
+
+          $patch = Join-Path $PWD "patches/0001-sdl3-switch-imu-calibration-fallback.patch"
+          git -c core.autocrlf=false -C sdl3 apply --verbose $patch
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "首次应用失败，改用 --ignore-whitespace 重试"
+            git -c core.autocrlf=false -C sdl3 apply --ignore-whitespace --verbose $patch
+            if ($LASTEXITCODE -ne 0) { throw "SDL3 补丁应用失败（版本 $ver 与补丁不匹配？）" }
+          }
+
+          $hit = Select-String -Path "sdl3/src/joystick/hidapi/SDL_hidapi_switch.c" -Pattern "defaultGyroScale"
+          if (-not $hit) { throw "补丁未生效：SDL_hidapi_switch.c 里找不到 defaultGyroScale" }
+          Write-Host "补丁生效，命中 $($hit.Count) 处"
+          $div = Select-String -Path "sdl3/src/joystick/hidapi/SDL_hidapi_switch.c" -Pattern "fGyroDivX > 0\.0f"
+          if (-not $div) { throw "补丁不完整：找不到除零兜底判断 fGyroDivX > 0.0f" }
+          git -C sdl3 diff --stat
+
+      # ── 坑位 9：ENABLE_QT_TRANSLATION 默认 OFF，界面只剩英文 ──
+      - name: 配置 Eden（SDL3 走源码树 + 静态 + MSVC）
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path -replace '\\','/'
+          $cmakeArgs = @(
+            "-S","eden","-B","build","-G","Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DYUZU_TESTS=OFF",
+            "-DYUZU_CMD=OFF",
+            "-DENABLE_QT=ON",
+            "-DYUZU_USE_BUNDLED_SDL3=OFF",
+            "-DSDL3_CUSTOM_DIR=$root/sdl3",
+            "-DSDL_SHARED=OFF","-DSDL_STATIC=ON",
+            "-DSDL_TESTS=OFF","-DSDL_TEST_LIBRARY=OFF"
+          )
+          $log = Join-Path $PWD "configure.log"
+
+          Write-Host "===== 配置（含翻译）====="
+          cmake @cmakeArgs "-DENABLE_QT_TRANSLATION=ON" 2>&1 | Tee-Object -FilePath $log
+          $ok = ($LASTEXITCODE -eq 0)
+
+          if (-not $ok) {
+            if (Select-String -Path $log -Pattern "LinguistTools" -Quiet) {
+              Write-Host "===== 内置 Qt 不含 LinguistTools，退回不编译翻译（界面会是英文）====="
+              cmake @cmakeArgs "-DENABLE_QT_TRANSLATION=OFF" 2>&1 | Tee-Object -FilePath $log -Append
+              $ok = ($LASTEXITCODE -eq 0)
+            }
+          }
+
+          if (-not $ok) {
+            Write-Host "===== 配置失败，CMake 关键日志 ====="
+            if (Test-Path build/CMakeFiles/CMakeError.log) { Get-Content build/CMakeFiles/CMakeError.log -Tail 100 }
+            if (Test-Path build/CMakeFiles/CMakeOutput.log) { Get-Content build/CMakeFiles/CMakeOutput.log -Tail 40 }
+            throw "Eden 配置失败"
+          }
+
+          # 自检：确认用的确实是 MSVC（clang-cl 与 MSVC 的行为差异是本项目最大的坑源）
+          $idline = Select-String -Path $log -Pattern "The CXX compiler identification is" | Select-Object -First 1
+          if (-not $idline) { throw "配置日志里找不到 CXX compiler identification，无法确认编译器" }
+          Write-Host $idline.Line.Trim()
+          if ($idline.Line -match "Clang") {
+            throw "本 workflow 期望纯 MSVC，实际识别为 Clang；请检查是否残留 CC/CXX 环境变量"
+          }
+          Write-Host "确认：正在用 MSVC 构建"
+
+          # ── 关键防护：/we#### 降级必须真的进入编译命令 ──
+          # 降级是在源码层做的。如果 Eden 在别处又加了 /we，或者降级发生在 configure 之后，
+          # 生成的 ninja 文件里就会残留 /we####。这里把所有 ninja 规则文件都扫一遍。
+          $ninjas = Get-ChildItem -Path build -Recurse -Filter "*.ninja" -ErrorAction SilentlyContinue
+          if (-not $ninjas) { throw "build 目录下没有生成任何 .ninja 文件（生成器不是 Ninja？）" }
+          Write-Host "检查 $($ninjas.Count) 个 ninja 文件里的 /we####"
+          $weCnt = 0
+          foreach ($nf in $ninjas) {
+            $m = Select-String -Path $nf.FullName -Pattern '/we\d{4}' -AllMatches
+            if ($m) {
+              $c = ($m | ForEach-Object { $_.Matches.Count } | Measure-Object -Sum).Sum
+              $weCnt += $c
+              Write-Host "  $($nf.Name)：$c 处"
+            }
+          }
+          if ($weCnt -gt 0) { throw "编译命令里仍残留 $weCnt 处 /we####，编译期会因 C4505/C4800 失败（坑位3 复现）" }
+          # 反向确认：/wd 确实进了编译命令（至少能看到我们降级出来的那批）
+          $wdCnt = 0
+          foreach ($nf in $ninjas) {
+            $m = Select-String -Path $nf.FullName -Pattern '/wd(4505|4800|4189|4062)' -AllMatches
+            if ($m) { $wdCnt += ($m | ForEach-Object { $_.Matches.Count } | Measure-Object -Sum).Sum }
+          }
+          Write-Host "确认：编译命令里没有 /we####；/wd4505 等已生效（命中 $wdCnt 次）"
+          # 这里只提示不中断：万一上游把整块 MSVC 选项挪进别的条件里，/wd 也可能不出现，
+          # 那种情况下构建反而是「更宽松」而不是失败，没必要拦住。
+          if ($wdCnt -eq 0) {
+            Write-Host "::warning title=未看到 /wd 开关::编译命令里没有 /wd4505 等降级后的开关，请确认降级步骤确实在 configure 之前执行"
+          }
+
+          $cache = Get-Content build/CMakeCache.txt -Raw
+          if ($cache -notmatch 'SDL3_CUSTOM_DIR') { throw "CMakeCache 里没有 SDL3_CUSTOM_DIR" }
+          Select-String -Path build/CMakeCache.txt -Pattern '^SDL3_CUSTOM_DIR|^YUZU_USE_BUNDLED_SDL3|^SDL_SHARED|^SDL_STATIC|^ENABLE_QT_TRANSLATION' |
+            ForEach-Object { Write-Host $_.Line }
+
+          $qrc = Get-ChildItem -Recurse build -Filter "languages.qrc" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($qrc) {
+            $langs = (Select-String -Path $qrc.FullName -Pattern '<file>').Count
+            Write-Host "翻译资源已生成：$($qrc.FullName)"
+            Write-Host "语言数量：$langs"
+            if ($langs -lt 20) { Write-Host "::warning title=语言数量偏少::只有 $langs 个语言，预期 27~29 个" }
+          } else {
+            Write-Host "::warning title=未生成翻译资源::没有 languages.qrc，界面可能仍然只有英文"
+          }
+
+      # ── 坑位 11：-k 0 一次性列全错误 ──
+      - name: 编译 Eden
+        shell: pwsh
+        run: |
+          $log = Join-Path $PWD "build.log"
+          cmake --build build --parallel -- -k 0 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host ""
+            Write-Host "==================== 编译错误汇总 ===================="
+            $codes = Select-String -Path $log -Pattern "error ([A-Z]+[0-9]+)" -AllMatches |
+                       ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } |
+                       Group-Object | Sort-Object Count -Descending
+            Write-Host "按错误码分组："
+            foreach ($c in $codes) { Write-Host ("  {0,-10} x{1}" -f $c.Name, $c.Count) }
+
+            $files = Select-String -Path $log -Pattern "([A-Za-z]:)?([A-Za-z0-9_\\/.-]+\.(c|cpp|cc|h))\([0-9]+\): error" -AllMatches |
+                       ForEach-Object { $_.Matches } | ForEach-Object { $_.Value -replace '\([0-9]+\): error.*$','' } |
+                       Sort-Object -Unique
+            Write-Host "出错文件："
+            foreach ($f in $files) { Write-Host "  $f" }
+
+            Write-Host "前 40 条明细："
+            $errs = Select-String -Path $log -Pattern "error [A-Z]+[0-9]+:|error:|FAILED:" | Select-Object -First 40
+            foreach ($e in $errs) { Write-Host $e.Line }
+            Write-Host "======================================================"
+
+            # 已知坑位的定向提示
+            if (Select-String -Path $log -Pattern "undefined symbol: __std_" -Quiet) {
+              Write-Host ""
+              Write-Host "【诊断·坑位10】链接缺少 __std_* 符号 = 当前 VS 的 STL 低于 Qt 6.11.1 编译时用的版本。"
+              Write-Host "        需要 VS 2026（runs-on: windows-2025）；检查上面打印的 Visual Studio 版本。"
+            }
+            if (Select-String -Path $log -Pattern "error C4505|error C4800" -Quiet) {
+              Write-Host ""
+              Write-Host "【诊断·坑位3】出现 C4505/C4800 = /we#### 仍在生效。"
+              Write-Host "        检查 build.ninja 是否残留 /we（配置步骤末尾有该断言）。"
+            }
+            if (Select-String -Path $log -Pattern "error C2440" -Quiet) {
+              Write-Host ""
+              Write-Host "【诊断·坑位2】出现 C2440 = 0002 补丁可能未生效，或 master 又新增了同类强制转换。"
+              Write-Host "        在日志里搜 error C2440 的具体行，按同样方式改 static_cast。"
+            }
+            if (Select-String -Path $log -Pattern "error C2[0-9]{3}" -Quiet) {
+              Write-Host ""
+              Write-Host "【诊断】出现 C2xxx = MSVC 编译器真实语法/语义错误（非警告升级）。"
+            }
+            throw "Eden 编译失败（exit $code）；完整日志见 Artifacts/build-log"
+          }
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log-msvc
+          path: |
+            build.log
+            configure.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 收集产物
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build/bin/eden.exe")) {
+            Write-Host "build/bin 内容："
+            Get-ChildItem -Recurse build/bin -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "没找到 build/bin/eden.exe"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse -Force build/bin/* dist/
+
+          if (Test-Path "dist/SDL3.dll") {
+            Write-Host "确认：动态链接，SDL3.dll 已在产物里"
+          } else {
+            $dll = Get-ChildItem -Path build -Recurse -Filter SDL3.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($dll) {
+              Write-Host "警告：链接的是动态库，补上 $($dll.FullName)"
+              Copy-Item $dll.FullName dist/
+            } else {
+              Write-Host "确认：静态链接，无需 SDL3.dll"
+            }
+          }
+
+          $info = @(
+            "eden_ref   = ${{ github.event.inputs.eden_ref }}",
+            "sdl_version= ${{ github.event.inputs.sdl_version }}",
+            "compiler   = MSVC (cl.exe)",
+            "run        = ${{ github.run_id }}",
+            "commit     = ${{ github.sha }}"
+          ) -join "`r`n"
+          Set-Content -Path dist/BUILD-INFO.txt -Value $info -Encoding utf8
+
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: eden-nightly-msvc-beitong-fix
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
