@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout（只为拿到补丁文件）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 克隆 Eden 源码
         shell: pwsh
@@ -40,6 +40,25 @@ jobs:
 
           git clone --depth 1 --branch $ref https://git.eden-emu.dev/eden-emu/eden.git eden
           if ($LASTEXITCODE -ne 0) { throw "克隆 Eden 失败：$ref" }
+
+          # Eden 自身在 MSVC 下的兼容性修复。
+          # 官方 Windows 版是用 llvm-mingw(clang) 交叉编译的，从没走过 MSVC，
+          # 所以 master 里偶有只有 MSVC 才报错的写法（见 patches/0002-*）。
+          $edenPatches = Get-ChildItem -Path "patches" -Filter "0002-eden-msvc-*.patch" -ErrorAction SilentlyContinue
+          foreach ($p in $edenPatches) {
+            Write-Host "应用 Eden 补丁：$($p.Name)"
+            git -c core.autocrlf=false -C eden apply --verbose $p.FullName
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "首次应用失败，改用 --ignore-whitespace 重试"
+              git -c core.autocrlf=false -C eden apply --ignore-whitespace --verbose $p.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Eden 补丁应用失败：$($p.Name)" }
+            }
+          }
+          if (Select-String -Path "eden/src/common/sparse_large_vector.cpp" -Pattern "static_cast<u64>" -Quiet) {
+            Write-Host "Eden 补丁已生效"
+          } elseif ($edenPatches) {
+            throw "Eden 补丁未生效"
+          }
 
           $commit = (git -C eden rev-parse HEAD).Trim()
           $branch = (git -C eden rev-parse --abbrev-ref HEAD).Trim()
@@ -54,9 +73,35 @@ jobs:
           git -C eden log -1 --format="%ad | %s" --date=short
 
       - name: 加载 MSVC x64 环境
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+        shell: pwsh
+        run: |
+          # 原方案用 ilammy/msvc-dev-cmd@v1，但它的运行时固定是 node20，已被 GitHub 弃用。
+          # 这里直接调 vcvars64.bat，把它导出的环境变量写进 GITHUB_ENV 给后续步骤用（动作内部做的也是这件事）。
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "找不到 vswhere.exe，runner 镜像可能变了" }
+          $vsPath = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $vsPath) { throw "找不到含 C++ 工具的 Visual Studio" }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { throw "找不到 vcvars64.bat：$vcvars" }
+          Write-Host "vcvars: $vcvars"
+
+          $lines = cmd /c "call `"$vcvars`" >nul 2>&1 && set"
+          $n = 0
+          foreach ($line in $lines) {
+            $i = $line.IndexOf('=')
+            if ($i -lt 1) { continue }        # 跳过 "=C:=..." 这类当前目录伪变量
+            $k = $line.Substring(0, $i)
+            $v = $line.Substring($i + 1)
+            Set-Item -Path "Env:$k" -Value $v -Force
+            Add-Content -Path $env:GITHUB_ENV -Value "$k=$v"
+            $n++
+          }
+          if ($n -lt 20) { throw "vcvars 环境变量导入异常，只有 $n 条" }
+          Write-Host "已导入 $n 个环境变量"
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          if (-not $cl) { throw "导入环境后仍找不到 cl.exe" }
+          Write-Host "cl.exe = $($cl.Source)"
+          $global:LASTEXITCODE = 0
 
       - name: 安装 Vulkan SDK
         # Eden 的脚本用了 PS7 已移除的 Get-WmiObject，必须走 Windows PowerShell 5.1
@@ -100,16 +145,35 @@ jobs:
         shell: pwsh
         run: |
           $root = (Get-Location).Path -replace '\\','/'
-          cmake -S eden -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DYUZU_TESTS=OFF `
-            -DYUZU_CMD=OFF `
-            -DENABLE_QT=ON `
-            -DYUZU_USE_BUNDLED_SDL3=OFF `
-            -DSDL3_CUSTOM_DIR="$root/sdl3" `
-            -DSDL_SHARED=OFF -DSDL_STATIC=ON `
-            -DSDL_TESTS=OFF -DSDL_TEST_LIBRARY=OFF
-          if ($LASTEXITCODE -ne 0) {
+          $cmakeArgs = @(
+            "-S","eden","-B","build","-G","Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DYUZU_TESTS=OFF",
+            "-DYUZU_CMD=OFF",
+            "-DENABLE_QT=ON",
+            "-DYUZU_USE_BUNDLED_SDL3=OFF",
+            "-DSDL3_CUSTOM_DIR=$root/sdl3",
+            "-DSDL_SHARED=OFF","-DSDL_STATIC=ON",
+            "-DSDL_TESTS=OFF","-DSDL_TEST_LIBRARY=OFF"
+          )
+          $log = Join-Path $PWD "configure.log"
+
+          # ENABLE_QT_TRANSLATION 默认 OFF，关掉后 dist/languages/*.ts 不参与编译，
+          # 界面只有英文、语言下拉框也只有 English。这里显式打开。
+          Write-Host "===== 配置（含翻译）====="
+          cmake @cmakeArgs "-DENABLE_QT_TRANSLATION=ON" 2>&1 | Tee-Object -FilePath $log
+          $ok = ($LASTEXITCODE -eq 0)
+
+          if (-not $ok) {
+            # 内置 Qt 是裁剪版，正常带 qttools（LinguistTools），万一没带就退回英文，保证能出包
+            if (Select-String -Path $log -Pattern "LinguistTools" -Quiet) {
+              Write-Host "===== 内置 Qt 不含 LinguistTools，退回不编译翻译（界面会是英文）====="
+              cmake @cmakeArgs "-DENABLE_QT_TRANSLATION=OFF" 2>&1 | Tee-Object -FilePath $log -Append
+              $ok = ($LASTEXITCODE -eq 0)
+            }
+          }
+
+          if (-not $ok) {
             Write-Host "===== 配置失败，CMake 关键日志 ====="
             if (Test-Path build/CMakeFiles/CMakeError.log) { Get-Content build/CMakeFiles/CMakeError.log -Tail 100 }
             if (Test-Path build/CMakeFiles/CMakeOutput.log) { Get-Content build/CMakeFiles/CMakeOutput.log -Tail 40 }
@@ -119,14 +183,44 @@ jobs:
           # 自检：确认真的用了我们修补后的 SDL3 源码目录
           $cache = Get-Content build/CMakeCache.txt -Raw
           if ($cache -notmatch 'SDL3_CUSTOM_DIR') { throw "CMakeCache 里没有 SDL3_CUSTOM_DIR" }
-          Select-String -Path build/CMakeCache.txt -Pattern '^SDL3_CUSTOM_DIR|^YUZU_USE_BUNDLED_SDL3|^SDL_SHARED|^SDL_STATIC' |
+          Select-String -Path build/CMakeCache.txt -Pattern '^SDL3_CUSTOM_DIR|^YUZU_USE_BUNDLED_SDL3|^SDL_SHARED|^SDL_STATIC|^ENABLE_QT_TRANSLATION' |
             ForEach-Object { Write-Host $_.Line }
+
+          # 自检：翻译资源 languages.qrc 是否真的生成了
+          $qrc = Get-ChildItem -Recurse build -Filter "languages.qrc" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($qrc) {
+            Write-Host "翻译资源已生成：$($qrc.FullName)"
+            Write-Host "语言数量：$((Select-String -Path $qrc.FullName -Pattern '<file>').Count)"
+          } else {
+            Write-Host "警告：没有生成 languages.qrc，界面可能仍然只有英文"
+          }
 
       - name: 编译 Eden
         shell: pwsh
         run: |
-          cmake --build build --parallel
-          if ($LASTEXITCODE -ne 0) { throw "Eden 编译失败" }
+          # -k 0：出错不立刻停，一次性把所有编译错误暴露出来（否则一轮只能修一个错，太慢）
+          $log = Join-Path $PWD "build.log"
+          cmake --build build --parallel -- -k 0 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Write-Host ""
+            Write-Host "==================== 编译错误汇总 ===================="
+            $errs = Select-String -Path $log -Pattern "error [A-Z]+[0-9]+:|error:|FAILED:" |
+                      Select-Object -First 80
+            foreach ($e in $errs) { Write-Host $e.Line }
+            Write-Host "======================================================"
+            Write-Host "错误条数：$($errs.Count)（最多显示 80 条）；完整日志见本步骤输出或 Artifacts/build-log"
+            throw "Eden 编译失败（exit $code）"
+          }
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: 收集产物
         shell: pwsh
@@ -155,7 +249,7 @@ jobs:
           Get-ChildItem -Recurse dist | Select-Object FullName, Length
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: eden-nightly-beitong-fix
           path: dist
