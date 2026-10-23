@@ -1,0 +1,138 @@
+name: Build Eden (patched SDL2)
+
+# 放在仓库的 .github/workflows/build-windows.yml
+# 用法：仓库页面 -> Actions -> 左侧 "Build Eden (patched SDL2)" -> Run workflow
+# 产物：运行结束后在该次 run 页面底部 Artifacts 里下载 eden-beitong-fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      eden_ref:
+        description: "Eden 的 tag/分支（默认 v0.2.1）"
+        required: false
+        default: "v0.2.1"
+      sdl_version:
+        description: "SDL2 源码版本（默认 2.32.10）"
+        required: false
+        default: "2.32.10"
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout（只为拿到补丁文件）
+        uses: actions/checkout@v4
+
+      - name: 克隆 Eden 源码
+        shell: pwsh
+        run: |
+          $ref = "${{ github.event.inputs.eden_ref }}"
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "v0.2.1" }
+          Write-Host "Eden ref = $ref"
+          git clone --depth 1 --branch $ref https://git.eden-emu.dev/eden-emu/eden.git eden
+          if ($LASTEXITCODE -ne 0) { throw "克隆 Eden 失败：$ref" }
+          git -C eden log -1 --format="commit %H %s"
+
+      - name: 加载 MSVC x64 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 安装 Vulkan SDK
+        shell: pwsh
+        run: |
+          # Eden 自带脚本，内部会识别 GITHUB_ACTIONS 并写 GITHUB_ENV / GITHUB_PATH
+          Push-Location eden
+          ./tools/windows/install-vulkan-sdk.ps1
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw "Vulkan SDK 安装失败（exit $code）" }
+          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+
+      - name: 下载并修补 SDL2 源码
+        shell: pwsh
+        run: |
+          $ver = "${{ github.event.inputs.sdl_version }}"
+          if ([string]::IsNullOrWhiteSpace($ver)) { $ver = "2.32.10" }
+          Write-Host "SDL version = $ver"
+
+          git clone --depth 1 --branch "release-$ver" https://github.com/libsdl-org/SDL.git sdl
+          if ($LASTEXITCODE -ne 0) { throw "克隆 SDL 失败：release-$ver" }
+
+          $patch = Join-Path $PWD "patches/0001-sdl2-switch-imu-calibration-fallback.patch"
+          git -C sdl apply --verbose $patch
+          if ($LASTEXITCODE -ne 0) { throw "SDL 补丁应用失败" }
+
+          # 自检：确认补丁真的进去了
+          $hit = Select-String -Path "sdl/src/joystick/hidapi/SDL_hidapi_switch.c" -Pattern "defaultGyroScale"
+          if (-not $hit) { throw "补丁未生效：源码里找不到 defaultGyroScale" }
+          Write-Host "补丁生效，命中 $($hit.Count) 处"
+          git -C sdl diff --stat
+
+      - name: 编译并安装 SDL2（静态库）
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path -replace '\\','/'
+          cmake -S sdl -B sdl-build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON `
+            -DSDL_TEST=OFF -DSDL_TESTS=OFF `
+            -DSDL_HIDAPI=ON -DSDL_JOYSTICK=ON -DSDL_SENSOR=ON `
+            -DCMAKE_INSTALL_PREFIX="$root/sdl-install"
+          if ($LASTEXITCODE -ne 0) { throw "SDL 配置失败" }
+
+          cmake --build sdl-build
+          if ($LASTEXITCODE -ne 0) { throw "SDL 编译失败" }
+
+          cmake --install sdl-build
+          if ($LASTEXITCODE -ne 0) { throw "SDL 安装失败" }
+
+          Get-ChildItem -Recurse sdl-install -Include *.lib,*-config.cmake |
+            Select-Object -ExpandProperty FullName
+
+      - name: 配置 Eden
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path -replace '\\','/'
+          cmake -S eden -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DYUZU_TESTS=OFF `
+            -DYUZU_CMD=OFF `
+            -DENABLE_QT=ON `
+            -DYUZU_USE_BUNDLED_SDL2=OFF `
+            -DYUZU_USE_EXTERNAL_SDL2=OFF `
+            -DCMAKE_PREFIX_PATH="$root/sdl-install"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "===== 配置失败，以下是 CMake 关键日志 ====="
+            if (Test-Path build/CMakeFiles/CMakeError.log) { Get-Content build/CMakeFiles/CMakeError.log -Tail 80 }
+            throw "Eden 配置失败"
+          }
+
+      - name: 编译 Eden
+        shell: pwsh
+        run: |
+          cmake --build build --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Eden 编译失败" }
+
+      - name: 收集产物
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build/bin/eden.exe")) {
+            Write-Host "build/bin 内容："
+            Get-ChildItem -Recurse build/bin -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "没找到 build/bin/eden.exe"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse -Force build/bin/* dist/
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-beitong-fix
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
