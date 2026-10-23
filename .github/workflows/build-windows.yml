@@ -184,11 +184,25 @@ jobs:
           cmake --build build --parallel -- -k 0 2>&1 | Tee-Object -FilePath $log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
-            Write-Host "===== 编译错误汇总 ====="
-            $errs = Select-String -Path $log -Pattern "error [A-Z]+[0-9]+:|error:|FAILED:" | Select-Object -First 80
+            Write-Host ""
+            Write-Host "==================== 编译错误汇总 ===================="
+            $codes = Select-String -Path $log -Pattern "error ([A-Z]+[0-9]+)" -AllMatches |
+                       ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } |
+                       Group-Object | Sort-Object Count -Descending
+            Write-Host "按错误码分组："
+            foreach ($c in $codes) { Write-Host ("  {0,-10} x{1}" -f $c.Name, $c.Count) }
+
+            $files = Select-String -Path $log -Pattern "([A-Za-z]:)?([A-Za-z0-9_\\/.-]+\.(c|cpp|cc|h))\([0-9]+\): error" -AllMatches |
+                       ForEach-Object { $_.Matches } | ForEach-Object { $_.Value -replace '\([0-9]+\): error.*$','' } |
+                       Sort-Object -Unique
+            Write-Host "出错文件："
+            foreach ($f in $files) { Write-Host "  $f" }
+
+            Write-Host "前 40 条明细："
+            $errs = Select-String -Path $log -Pattern "error [A-Z]+[0-9]+:|error:|FAILED:" | Select-Object -First 40
             foreach ($e in $errs) { Write-Host $e.Line }
-            Write-Host "错误条数：$($errs.Count)（最多显示 80 条）"
-            throw "Eden 编译失败（exit $code）"
+            Write-Host "======================================================"
+            throw "Eden 编译失败（exit $code）；完整日志见 Artifacts/build-log"
           }
 
       - name: 上传编译日志（失败时）
