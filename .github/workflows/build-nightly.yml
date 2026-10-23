@@ -1,0 +1,163 @@
+name: Build Eden Nightly (patched SDL3)
+
+# 放在仓库的 .github/workflows/build-nightly.yml
+# 用法：仓库页面 -> Actions -> 左侧 "Build Eden Nightly (patched SDL3)" -> Run workflow
+# 产物：运行结束后在该次 run 页面底部 Artifacts 里下载 eden-nightly-beitong-fix
+#
+# 与 build-windows.yml（v0.2.1 + SDL2）的区别：
+#   - 代码来自 master（夜版就是 master 每天 14:00 UTC 的构建）
+#   - master 已迁到 SDL3，所以打的是 0001-sdl3-...patch
+#   - SDL3 不再单独安装，直接用 SDL3_CUSTOM_DIR 让 Eden 在源码树里一起编（静态链接，产物只有一个 exe）
+
+on:
+  workflow_dispatch:
+    inputs:
+      eden_ref:
+        description: "Eden 的 tag/分支/提交（默认 master = 夜版）"
+        required: false
+        default: "master"
+      sdl_version:
+        description: "SDL3 源码版本（官方夜版用 crueter-ci/SDL3 3.4.14，这里默认对齐 3.4.14）"
+        required: false
+        default: "3.4.14"
+
+jobs:
+  build:
+    name: Windows x64 (nightly)
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout（只为拿到补丁文件）
+        uses: actions/checkout@v4
+
+      - name: 克隆 Eden 源码
+        shell: pwsh
+        run: |
+          $ref = "${{ github.event.inputs.eden_ref }}"
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "master" }
+          Write-Host "Eden ref = $ref"
+
+          git clone --depth 1 --branch $ref https://git.eden-emu.dev/eden-emu/eden.git eden
+          if ($LASTEXITCODE -ne 0) { throw "克隆 Eden 失败：$ref" }
+
+          $commit = (git -C eden rev-parse HEAD).Trim()
+          $branch = (git -C eden rev-parse --abbrev-ref HEAD).Trim()
+          if ($branch -eq "HEAD") { $branch = $ref }
+
+          # GetSCMRev 会优先读这三个文件，写进去就不用整仓库完整历史（223MB）
+          Set-Content -Path eden/GIT-COMMIT  -Value $commit -NoNewline -Encoding ascii
+          Set-Content -Path eden/GIT-REFSPEC -Value $branch -NoNewline -Encoding ascii
+          Set-Content -Path eden/GIT-TAG     -Value $branch -NoNewline -Encoding ascii
+
+          Write-Host "commit = $commit / ref = $branch"
+          git -C eden log -1 --format="%ad | %s" --date=short
+
+      - name: 加载 MSVC x64 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 安装 Vulkan SDK
+        # Eden 的脚本用了 PS7 已移除的 Get-WmiObject，必须走 Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          Push-Location eden
+          try {
+            ./tools/windows/install-vulkan-sdk.ps1
+          } finally {
+            Pop-Location
+          }
+          # 脚本提前 return 时 $LASTEXITCODE 可能是 $null，不能用 -ne 0 判断
+          if ($LASTEXITCODE) { throw "Vulkan SDK 安装失败（exit $LASTEXITCODE）" }
+          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+
+      - name: 下载并修补 SDL3 源码
+        shell: pwsh
+        run: |
+          $ver = "${{ github.event.inputs.sdl_version }}"
+          if ([string]::IsNullOrWhiteSpace($ver)) { $ver = "3.4.14" }
+          Write-Host "SDL3 version = $ver"
+
+          # runner 的全局 core.autocrlf 可能是 true，会把源码检出成 CRLF，LF 补丁就打不上
+          git -c core.autocrlf=false -c core.eol=lf clone --depth 1 --branch "release-$ver" https://github.com/libsdl-org/SDL.git sdl3
+          if ($LASTEXITCODE -ne 0) { throw "克隆 SDL3 失败：release-$ver" }
+
+          $patch = Join-Path $PWD "patches/0001-sdl3-switch-imu-calibration-fallback.patch"
+          git -c core.autocrlf=false -C sdl3 apply --verbose $patch
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "首次应用失败，改用 --ignore-whitespace 重试"
+            git -c core.autocrlf=false -C sdl3 apply --ignore-whitespace --verbose $patch
+            if ($LASTEXITCODE -ne 0) { throw "SDL3 补丁应用失败（版本不匹配？）" }
+          }
+
+          $hit = Select-String -Path "sdl3/src/joystick/hidapi/SDL_hidapi_switch.c" -Pattern "defaultGyroScale"
+          if (-not $hit) { throw "补丁未生效：源码里找不到 defaultGyroScale" }
+          Write-Host "补丁生效，命中 $($hit.Count) 处"
+          git -C sdl3 diff --stat
+
+      - name: 配置 Eden（SDL3 走源码树 + 静态）
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path -replace '\\','/'
+          cmake -S eden -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DYUZU_TESTS=OFF `
+            -DYUZU_CMD=OFF `
+            -DENABLE_QT=ON `
+            -DYUZU_USE_BUNDLED_SDL3=OFF `
+            -DSDL3_CUSTOM_DIR="$root/sdl3" `
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON `
+            -DSDL_TESTS=OFF -DSDL_TEST_LIBRARY=OFF
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "===== 配置失败，CMake 关键日志 ====="
+            if (Test-Path build/CMakeFiles/CMakeError.log) { Get-Content build/CMakeFiles/CMakeError.log -Tail 100 }
+            if (Test-Path build/CMakeFiles/CMakeOutput.log) { Get-Content build/CMakeFiles/CMakeOutput.log -Tail 40 }
+            throw "Eden 配置失败"
+          }
+
+          # 自检：确认真的用了我们修补后的 SDL3 源码目录
+          $cache = Get-Content build/CMakeCache.txt -Raw
+          if ($cache -notmatch 'SDL3_CUSTOM_DIR') { throw "CMakeCache 里没有 SDL3_CUSTOM_DIR" }
+          Select-String -Path build/CMakeCache.txt -Pattern '^SDL3_CUSTOM_DIR|^YUZU_USE_BUNDLED_SDL3|^SDL_SHARED|^SDL_STATIC' |
+            ForEach-Object { Write-Host $_.Line }
+
+      - name: 编译 Eden
+        shell: pwsh
+        run: |
+          cmake --build build --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Eden 编译失败" }
+
+      - name: 收集产物
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "build/bin/eden.exe")) {
+            Write-Host "build/bin 内容："
+            Get-ChildItem -Recurse build/bin -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "没找到 build/bin/eden.exe"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse -Force build/bin/* dist/
+
+          # 静态链接的话不需要 SDL3.dll；万一退化成了动态库，把它一起带上免得产物跑不起来
+          if (Test-Path "dist/SDL3.dll") {
+            Write-Host "确认：动态链接，SDL3.dll 已在产物里"
+          } else {
+            $dll = Get-ChildItem -Path build -Recurse -Filter SDL3.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($dll) {
+              Write-Host "警告：链接的是动态库，补上 $($dll.FullName)"
+              Copy-Item $dll.FullName dist/
+            } else {
+              Write-Host "确认：静态链接，无需 SDL3.dll"
+            }
+          }
+
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-nightly-beitong-fix
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
