@@ -46,10 +46,13 @@ jobs:
         run: |
           # Eden 自带脚本，内部会识别 GITHUB_ACTIONS 并写 GITHUB_ENV / GITHUB_PATH
           Push-Location eden
-          ./tools/windows/install-vulkan-sdk.ps1
-          $code = $LASTEXITCODE
-          Pop-Location
-          if ($code -ne 0) { throw "Vulkan SDK 安装失败（exit $code）" }
+          try {
+            ./tools/windows/install-vulkan-sdk.ps1
+          } finally {
+            Pop-Location
+          }
+          # 注意：脚本提前 return 时 $LASTEXITCODE 可能是 $null，不能用 -ne 0 判断
+          if ($LASTEXITCODE) { throw "Vulkan SDK 安装失败（exit $LASTEXITCODE）" }
           Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
 
       - name: 下载并修补 SDL2 源码
@@ -59,12 +62,18 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($ver)) { $ver = "2.32.10" }
           Write-Host "SDL version = $ver"
 
-          git clone --depth 1 --branch "release-$ver" https://github.com/libsdl-org/SDL.git sdl
+          # Windows runner 的全局 core.autocrlf 可能是 true，会把源码检出成 CRLF，
+          # 导致 LF 格式的补丁匹配不上。这里强制按 LF 检出。
+          git -c core.autocrlf=false -c core.eol=lf clone --depth 1 --branch "release-$ver" https://github.com/libsdl-org/SDL.git sdl
           if ($LASTEXITCODE -ne 0) { throw "克隆 SDL 失败：release-$ver" }
 
           $patch = Join-Path $PWD "patches/0001-sdl2-switch-imu-calibration-fallback.patch"
-          git -C sdl apply --verbose $patch
-          if ($LASTEXITCODE -ne 0) { throw "SDL 补丁应用失败" }
+          git -c core.autocrlf=false -C sdl apply --verbose $patch
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "首次应用失败，改用 --ignore-whitespace 重试"
+            git -c core.autocrlf=false -C sdl apply --ignore-whitespace --verbose $patch
+            if ($LASTEXITCODE -ne 0) { throw "SDL 补丁应用失败" }
+          }
 
           # 自检：确认补丁真的进去了
           $hit = Select-String -Path "sdl/src/joystick/hidapi/SDL_hidapi_switch.c" -Pattern "defaultGyroScale"
