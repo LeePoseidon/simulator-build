@@ -72,6 +72,27 @@ jobs:
           Write-Host "commit = $commit / ref = $branch"
           git -C eden log -1 --format="%ad | %s" --date=short
 
+      - name: 降级 Eden 的「MSVC 警告即错误」开关
+        shell: pwsh
+        run: |
+          # Eden 在 src/CMakeLists.txt 里给 MSVC 打开了一批 /we#### 把警告当错误，
+          # 这些开关是目录级的，对以 #include 方式编进来的第三方代码同样生效。
+          # master 的 src/common/zbic_compression.cpp 直接 include 了 zstd 的单文件合并版，
+          # 里面有 175 个未被引用的 static 函数，触发 C4505 → 整个 TU 编译失败。
+          # 官方只用 clang 构建，clang 没有这套 /we，所以永远碰不到。
+          # 这里把它们统一降级为普通警告（/we#### -> /w####），只改诊断级别，不改任何代码行为。
+          $cm = "eden/src/CMakeLists.txt"
+          if (-not (Test-Path $cm)) { throw "找不到 $cm" }
+          $before = (Select-String -Path $cm -Pattern '/we\d{4}').Count
+          $text = Get-Content $cm -Raw
+          $text = [regex]::Replace($text, '/we(\d{4})', '/w$1')
+          [IO.File]::WriteAllText($cm, $text, (New-Object System.Text.UTF8Encoding($false)))
+          $after = (Select-String -Path $cm -Pattern '/we\d{4}').Count
+          Write-Host "警告即错误开关：降级前 $before 处，降级后剩余 $after 处"
+          if ($before -lt 10) { throw "没找到预期的 /we#### 开关（只有 $before 处），Eden 的 CMakeLists 可能改过，需要重新确认" }
+          if ($after -ne 0) { throw "仍有 $after 处 /we#### 未降级" }
+          Select-String -Path $cm -Pattern '/w4505|/w4189' | ForEach-Object { Write-Host $_.Line.Trim() }
+
       - name: 加载 MSVC x64 环境
         shell: pwsh
         run: |
@@ -205,12 +226,23 @@ jobs:
           if ($code -ne 0) {
             Write-Host ""
             Write-Host "==================== 编译错误汇总 ===================="
-            $errs = Select-String -Path $log -Pattern "error [A-Z]+[0-9]+:|error:|FAILED:" |
-                      Select-Object -First 80
+            $codes = Select-String -Path $log -Pattern "error ([A-Z]+[0-9]+)" -AllMatches |
+                       ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } |
+                       Group-Object | Sort-Object Count -Descending
+            Write-Host "按错误码分组："
+            foreach ($c in $codes) { Write-Host ("  {0,-10} x{1}" -f $c.Name, $c.Count) }
+
+            $files = Select-String -Path $log -Pattern "([A-Za-z]:)?([A-Za-z0-9_\\/.-]+\.(c|cpp|cc|h))\([0-9]+\): error" -AllMatches |
+                       ForEach-Object { $_.Matches } | ForEach-Object { $_.Value -replace '\([0-9]+\): error.*$','' } |
+                       Sort-Object -Unique
+            Write-Host "出错文件："
+            foreach ($f in $files) { Write-Host "  $f" }
+
+            Write-Host "前 40 条明细："
+            $errs = Select-String -Path $log -Pattern "error [A-Z]+[0-9]+:|error:|FAILED:" | Select-Object -First 40
             foreach ($e in $errs) { Write-Host $e.Line }
             Write-Host "======================================================"
-            Write-Host "错误条数：$($errs.Count)（最多显示 80 条）；完整日志见本步骤输出或 Artifacts/build-log"
-            throw "Eden 编译失败（exit $code）"
+            throw "Eden 编译失败（exit $code）；完整日志见 Artifacts/build-log"
           }
 
       - name: 上传编译日志（失败时）
