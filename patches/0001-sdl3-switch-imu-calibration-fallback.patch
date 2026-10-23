@@ -1,0 +1,43 @@
+diff --git a/src/joystick/hidapi/SDL_hidapi_switch.c b/src/joystick/hidapi/SDL_hidapi_switch.c
+index 514e158..3901807 100644
+--- a/src/joystick/hidapi/SDL_hidapi_switch.c
++++ b/src/joystick/hidapi/SDL_hidapi_switch.c
+@@ -1125,15 +1125,32 @@ static bool LoadIMUCalibration(SDL_DriverSwitch_Context *ctx)
+             sGyroRawZ = (pIMUScale[19] << 8) | pIMUScale[18];
+         }
+ 
++        // The SPI ROM of some third party controllers (Beitong/Kunpeng and other
++        // clones impersonating a Pro Controller) contains no IMU calibration at
++        // all, so both the sensitivity coefficients and the raw reference values
++        // read back as zero. That makes the divisors below zero and the scale
++        // computed from them infinite or NaN, which silences motion input while
++        // buttons and sticks keep working. Fall back to the factory default scale
++        // when the calibration data cannot be trusted.
++        const float defaultAccelScale = SDL_STANDARD_GRAVITY / SWITCH_ACCEL_SCALE;
++        const float defaultGyroScale = SDL_PI_F / 180.0f / SWITCH_GYRO_SCALE;
++
++        float fAccelDivX = (float)sAccelSensCoeffX - (float)sAccelRawX;
++        float fAccelDivY = (float)sAccelSensCoeffY - (float)sAccelRawY;
++        float fAccelDivZ = (float)sAccelSensCoeffZ - (float)sAccelRawZ;
++        float fGyroDivX = (float)sGyroSensCoeffX - (float)sGyroRawX;
++        float fGyroDivY = (float)sGyroSensCoeffY - (float)sGyroRawY;
++        float fGyroDivZ = (float)sGyroSensCoeffZ - (float)sGyroRawZ;
++
+         // Accelerometer scale
+-        ctx->m_IMUScaleData.fAccelScaleX = SWITCH_ACCEL_SCALE_MULT / ((float)sAccelSensCoeffX - (float)sAccelRawX) * SDL_STANDARD_GRAVITY;
+-        ctx->m_IMUScaleData.fAccelScaleY = SWITCH_ACCEL_SCALE_MULT / ((float)sAccelSensCoeffY - (float)sAccelRawY) * SDL_STANDARD_GRAVITY;
+-        ctx->m_IMUScaleData.fAccelScaleZ = SWITCH_ACCEL_SCALE_MULT / ((float)sAccelSensCoeffZ - (float)sAccelRawZ) * SDL_STANDARD_GRAVITY;
++        ctx->m_IMUScaleData.fAccelScaleX = (fAccelDivX > 0.0f) ? (SWITCH_ACCEL_SCALE_MULT / fAccelDivX * SDL_STANDARD_GRAVITY) : defaultAccelScale;
++        ctx->m_IMUScaleData.fAccelScaleY = (fAccelDivY > 0.0f) ? (SWITCH_ACCEL_SCALE_MULT / fAccelDivY * SDL_STANDARD_GRAVITY) : defaultAccelScale;
++        ctx->m_IMUScaleData.fAccelScaleZ = (fAccelDivZ > 0.0f) ? (SWITCH_ACCEL_SCALE_MULT / fAccelDivZ * SDL_STANDARD_GRAVITY) : defaultAccelScale;
+ 
+         // Gyro scale
+-        ctx->m_IMUScaleData.fGyroScaleX = SWITCH_GYRO_SCALE_MULT / ((float)sGyroSensCoeffX - (float)sGyroRawX) * SDL_PI_F / 180.0f;
+-        ctx->m_IMUScaleData.fGyroScaleY = SWITCH_GYRO_SCALE_MULT / ((float)sGyroSensCoeffY - (float)sGyroRawY) * SDL_PI_F / 180.0f;
+-        ctx->m_IMUScaleData.fGyroScaleZ = SWITCH_GYRO_SCALE_MULT / ((float)sGyroSensCoeffZ - (float)sGyroRawZ) * SDL_PI_F / 180.0f;
++        ctx->m_IMUScaleData.fGyroScaleX = (fGyroDivX > 0.0f) ? (SWITCH_GYRO_SCALE_MULT / fGyroDivX * SDL_PI_F / 180.0f) : defaultGyroScale;
++        ctx->m_IMUScaleData.fGyroScaleY = (fGyroDivY > 0.0f) ? (SWITCH_GYRO_SCALE_MULT / fGyroDivY * SDL_PI_F / 180.0f) : defaultGyroScale;
++        ctx->m_IMUScaleData.fGyroScaleZ = (fGyroDivZ > 0.0f) ? (SWITCH_GYRO_SCALE_MULT / fGyroDivZ * SDL_PI_F / 180.0f) : defaultGyroScale;
+ 
+     } else {
+         // Use default values
