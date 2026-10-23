@@ -75,23 +75,35 @@ jobs:
       - name: 降级 Eden 的「MSVC 警告即错误」开关
         shell: pwsh
         run: |
-          # Eden 在 src/CMakeLists.txt 里给 MSVC 打开了一批 /we#### 把警告当错误，
-          # 这些开关是目录级的，对以 #include 方式编进来的第三方代码同样生效。
-          # master 的 src/common/zbic_compression.cpp 直接 include 了 zstd 的单文件合并版，
-          # 里面有 175 个未被引用的 static 函数，触发 C4505 → 整个 TU 编译失败。
-          # 官方只用 clang 构建，clang 没有这套 /we，所以永远碰不到。
-          # 这里把它们统一降级为普通警告（/we#### -> /w####），只改诊断级别，不改任何代码行为。
-          $cm = "eden/src/CMakeLists.txt"
-          if (-not (Test-Path $cm)) { throw "找不到 $cm" }
-          $before = (Select-String -Path $cm -Pattern '/we\d{4}').Count
-          $text = Get-Content $cm -Raw
-          $text = [regex]::Replace($text, '/we(\d{4})', '/w$1')
-          [IO.File]::WriteAllText($cm, $text, (New-Object System.Text.UTF8Encoding($false)))
-          $after = (Select-String -Path $cm -Pattern '/we\d{4}').Count
-          Write-Host "警告即错误开关：降级前 $before 处，降级后剩余 $after 处"
-          if ($before -lt 10) { throw "没找到预期的 /we#### 开关（只有 $before 处），Eden 的 CMakeLists 可能改过，需要重新确认" }
-          if ($after -ne 0) { throw "仍有 $after 处 /we#### 未降级" }
-          Select-String -Path $cm -Pattern '/w4505|/w4189' | ForEach-Object { Write-Host $_.Line.Trim() }
+          # Eden 在 8 个 CMakeLists.txt 里给 MSVC 打开了一批 /we####（把指定警告当错误），
+          # 共 43 处。这些开关是目录级的，对以 #include 方式编进来的第三方代码同样生效：
+          #   - src/common 的 zbic_compression.cpp 直接 include zstd 合并版 → 175 个 C4505
+          #   - src/core 的 launch_params.cpp 触发 C4800（int→bool 隐式转换）
+          # 官方只用 clang 构建，clang 没有这套 /we，所以上游永远碰不到。
+          # 这里统一改成 /wd####（直接关掉该警告），只影响诊断级别，不改任何代码行为。
+          # 注意不能用 /w####：MSVC 会把它解析成 "/w4 + 数字"，报 D9014 并忽略，等于没生效。
+          $files = Get-ChildItem -Path "eden" -Recurse -File -Include "CMakeLists.txt","*.cmake" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -notmatch '\\\.git\\|\\\.cache\\' }
+          $total = 0
+          foreach ($f in $files) {
+            $text = Get-Content $f.FullName -Raw
+            if ($text -notmatch '/we\d{4}') { continue }
+            $hit = ([regex]::Matches($text, '/we\d{4}')).Count
+            $new = [regex]::Replace($text, '/we(\d{4})', '/wd$1')
+            [IO.File]::WriteAllText($f.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
+            $total += $hit
+            Write-Host ("  {0,-42} {1} 处" -f $f.FullName.Replace((Get-Location).Path + '\',''), $hit)
+          }
+          Write-Host "合计降级 $total 处：/we#### -> /wd####"
+          if ($total -lt 30) { throw "只找到 $total 处 /we####，Eden 的 CMake 结构可能改过，需要重新确认" }
+
+          # 二次扫描：确认全仓残留为 0（漏一个就会在编译时报红）
+          $left = 0
+          foreach ($f in $files) {
+            $left += ([regex]::Matches((Get-Content $f.FullName -Raw), '/we\d{4}')).Count
+          }
+          Write-Host "残留 /we####：$left 处"
+          if ($left -ne 0) { throw "仍有 $left 处 /we#### 未降级" }
 
       - name: 加载 MSVC x64 环境
         shell: pwsh
