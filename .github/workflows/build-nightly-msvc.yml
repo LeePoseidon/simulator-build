@@ -251,7 +251,10 @@ jobs:
             "-DYUZU_USE_BUNDLED_SDL3=OFF",
             "-DSDL3_CUSTOM_DIR=$root/sdl3",
             "-DSDL_SHARED=OFF","-DSDL_STATIC=ON",
-            "-DSDL_TESTS=OFF","-DSDL_TEST_LIBRARY=OFF"
+            "-DSDL_TESTS=OFF","-DSDL_TEST_LIBRARY=OFF",
+            # 下面一步会直接修改生成的 ninja 文件（清洗第三方依赖带进来的 /we####）。
+            # 关掉自动重新生成，避免 Ninja 在构建前又跑一次 CMake 把我们的修改覆盖掉。
+            "-DCMAKE_SUPPRESS_REGENERATION=ON"
           )
           $log = Join-Path $PWD "configure.log"
 
@@ -283,31 +286,61 @@ jobs:
           }
           Write-Host "确认：正在用 MSVC 构建"
 
-          # ── 关键防护：/we#### 降级必须真的进入编译命令 ──
-          # 降级是在源码层做的。如果 Eden 在别处又加了 /we，或者降级发生在 configure 之后，
-          # 生成的 ninja 文件里就会残留 /we####。这里把所有 ninja 规则文件都扫一遍。
+          # ── 关键防护：/we#### 必须从最终编译命令里消失 ──
+          # 源码层降级只能覆盖 Eden 自己的 8 个 CMakeLists（那 43 处）。实测 configure 时
+          # CPM 下载到 eden/.cache/cpm/** 的第三方依赖在 MSVC 下也会加 /we####，而那时
+          # 降级步骤早就跑完了，所以必须在生成之后再做一次清洗。
+          # 这里改的是「编译命令行」，不动任何源码或依赖，语义完全不变。
+          # 注意：只让 build.ninja 变新、不动任何输入文件，Ninja 不会因此重新执行 CMake。
           $ninjas = Get-ChildItem -Path build -Recurse -Filter "*.ninja" -ErrorAction SilentlyContinue
           if (-not $ninjas) { throw "build 目录下没有生成任何 .ninja 文件（生成器不是 Ninja？）" }
           Write-Host "检查 $($ninjas.Count) 个 ninja 文件里的 /we####"
-          $weCnt = 0
+
+          $repaired = 0
+          $shown = 0
           foreach ($nf in $ninjas) {
-            $m = Select-String -Path $nf.FullName -Pattern '/we\d{4}' -AllMatches
-            if ($m) {
-              $c = ($m | ForEach-Object { $_.Matches.Count } | Measure-Object -Sum).Sum
-              $weCnt += $c
-              Write-Host "  $($nf.Name)：$c 处"
+            $t = Get-Content $nf.FullName -Raw
+            $m = [regex]::Matches($t, '/we\d{4}')
+            if ($m.Count -eq 0) { continue }
+
+            # 先把残留来源打出来，方便日后判断是哪个依赖带进来的（最多展示 6 行）
+            if ($shown -lt 6) {
+              foreach ($ln in (Select-String -Path $nf.FullName -Pattern '/we\d{4}' | Select-Object -First 2)) {
+                $txt = $ln.Line.Trim()
+                if ($txt.Length -gt 220) { $txt = $txt.Substring(0, 220) + " ..." }
+                Write-Host ("  残留片段 {0}: {1}" -f $nf.Name, $txt)
+                $shown++
+              }
             }
+
+            $t2 = [regex]::Replace($t, '/we(\d{4})', '/wd$1')
+            [IO.File]::WriteAllText($nf.FullName, $t2, (New-Object System.Text.UTF8Encoding($false)))
+            $repaired += $m.Count
+            Write-Host ("  清洗 {0}：{1} 处" -f $nf.Name, $m.Count)
           }
-          if ($weCnt -gt 0) { throw "编译命令里仍残留 $weCnt 处 /we####，编译期会因 C4505/C4800 失败（坑位3 复现）" }
-          # 反向确认：/wd 确实进了编译命令（至少能看到我们降级出来的那批）
+          if ($repaired -gt 0) {
+            Write-Host "共清洗 $repaired 处 /we#### -> /wd####（来自第三方依赖，源码层降级覆盖不到）"
+          } else {
+            Write-Host "无需清洗：编译命令里本来就没有 /we####"
+          }
+
+          # 复检：清洗后必须清零
+          $left2 = 0
+          foreach ($nf in $ninjas) {
+            $left2 += ([regex]::Matches((Get-Content $nf.FullName -Raw), '/we\d{4}')).Count
+          }
+          Write-Host "复检残留 /we####：$left2 处"
+          if ($left2 -ne 0) { throw "ninja 文件里仍有 $left2 处 /we#### 未清洗，编译期会因 C4505/C4800 失败（坑位3 复现）" }
+
+          # 反向确认：/wd 确实进了编译命令（降级/清洗真的生效了）
           $wdCnt = 0
           foreach ($nf in $ninjas) {
             $m = Select-String -Path $nf.FullName -Pattern '/wd(4505|4800|4189|4062)' -AllMatches
             if ($m) { $wdCnt += ($m | ForEach-Object { $_.Matches.Count } | Measure-Object -Sum).Sum }
           }
           Write-Host "确认：编译命令里没有 /we####；/wd4505 等已生效（命中 $wdCnt 次）"
-          # 这里只提示不中断：万一上游把整块 MSVC 选项挪进别的条件里，/wd 也可能不出现，
-          # 那种情况下构建反而是「更宽松」而不是失败，没必要拦住。
+          # 只提示不中断：万一上游把整块 MSVC 选项挪进别的条件里，/wd 也可能不出现，
+          # 那种情况下构建只是「更宽松」而不是失败，没必要拦住。
           if ($wdCnt -eq 0) {
             Write-Host "::warning title=未看到 /wd 开关::编译命令里没有 /wd4505 等降级后的开关，请确认降级步骤确实在 configure 之前执行"
           }
