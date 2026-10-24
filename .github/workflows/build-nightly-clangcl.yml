@@ -14,8 +14,10 @@ name: Build Eden Nightly (clang-cl)
 #   它仍然使用 MSVC 的 link.exe、Windows SDK、UCRT，所以 MSVC 版的 Qt / ffmpeg / Vulkan
 #   全部可直接复用，不需要另起一套工具链。
 #
-# 【与 build-nightly-msvc.yml 的关系】
-#   两条路线互相独立、可同时存在、产物名不同，方便 A/B 对比。
+# 【为什么夜版只有 clang-cl 这一条】
+#   曾经还有一份「夜版 + 纯 MSVC」的 workflow，已删除。纯 MSVC 需要持续替上游做适配
+#   （/we#### 降级 + ninja 清洗），而官方根本不走这条路；clang-cl 只换前端、ABI 与依赖
+#   都不变，已实测能完整编译（2106 个目标）并正常运行。
 #   本文件不包含 /we#### 降级步骤（clang-cl 用不到），但包含 SDL3 补丁与 0002 补丁。
 
 on:
@@ -75,8 +77,20 @@ jobs:
           # ExceptionInformation[] 的类型是 ULONG_PTR。MSVC 把 unsigned __int64 与
           # unsigned long long 当作不同类型，reinterpret_cast 非法 → C2440。
           # 官方只用 clang 系列构建，所以上游从不报错。这里打 0002 补丁改成 static_cast。
-          $edenPatches = Get-ChildItem -Path "patches" -Filter "0002-eden-msvc-*.patch" -ErrorAction SilentlyContinue
-          if (-not $edenPatches) { throw "没找到 0002-eden-msvc-*.patch" }
+          #
+          # ── 坑位 14：手柄断开重连后体感失效 ──
+          # SDL3 的 sensor_timestamp 来自每个设备上下文的计数器（从 0 开始累加），
+          # 手柄关机重连 = 新上下文 = 时间戳回到 0；而 Eden 的 SDLJoystick 对象在重连时
+          # 被复用、last_motion_update 保留着上一场的高值，于是每帧都被 "时间戳倒退" 判断
+          # 丢弃，体感彻底静默（按键摇杆不受影响）。0003 补丁在重连时重置基线。
+          # 只应用"当前有效"的 Eden 补丁；显式排除已作废的
+          # 0002-eden-allow-sdl2-build-from-source（它只对 SDL2 那条路线有意义，
+          # 拿来打 master 会失败）。新加 0004-eden-*.patch 会被自动带上。
+          $edenPatches = Get-ChildItem -Path "patches" -Filter "*-eden-*.patch" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -notlike "*allow-sdl2*" } |
+                         Sort-Object Name
+          if (-not $edenPatches) { throw "patches/ 下没找到任何有效 Eden 补丁（至少应有 0002-eden-msvc-static-cast）" }
+          Write-Host "待应用的 Eden 补丁：$($edenPatches.Name -join ', ')"
           foreach ($p in $edenPatches) {
             Write-Host "应用 Eden 补丁：$($p.Name)"
             git -c core.autocrlf=false -C eden apply --verbose $p.FullName
@@ -93,7 +107,17 @@ jobs:
           if (Select-String -Path "eden/src/common/sparse_large_vector.cpp" -Pattern "reinterpret_cast<u64>\(info->ExceptionRecord" -Quiet) {
             throw "Eden 补丁未生效：旧的 reinterpret_cast<u64> 仍在"
           }
-          Write-Host "Eden 补丁已生效"
+
+          # ── 自查 0003：重连体感修复必须真的落进源码 ──
+          $sdlDrv = "eden/src/input_common/drivers/sdl_driver.cpp"
+          if (-not (Test-Path $sdlDrv)) { throw "找不到 $sdlDrv" }
+          if (-not (Select-String -Path $sdlDrv -Pattern "last_motion_update = 0;" -Quiet)) {
+            throw "0003 补丁未生效：sdl_driver.cpp 里找不到 last_motion_update = 0;（重连后体感仍会失效）"
+          }
+          if (-not (Select-String -Path $sdlDrv -Pattern "1'000'000'000ULL" -Quiet)) {
+            throw "0003 补丁未生效：找不到时间戳倒退的容差判断"
+          }
+          Write-Host "Eden 补丁已生效（0002 static_cast + 0003 体感时间戳重置）"
 
           $commit = (git -C eden rev-parse HEAD).Trim()
           $branch = (git -C eden rev-parse --abbrev-ref HEAD).Trim()
