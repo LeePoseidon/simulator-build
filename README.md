@@ -1,8 +1,6 @@
 # simulator-build
 
 给 [Eden](https://git.eden-emu.dev/eden-emu/eden)（Switch 模拟器）打补丁并用 GitHub Actions 构建 Windows 版。
-起因：北通等第三方手柄在 Switch 模式下能正常按键/摇杆，但**体感（陀螺仪）失效**。本机没有 MSVC/Qt6
-工具链，所以整条链路放到 CI 上跑，产物直接下载解包即可用。
 
 ## 目录
 
@@ -16,18 +14,6 @@ patches/
   build-nightly-msvc.yml                            # 夜版（master + SDL3），纯 MSVC
   build-windows.yml                                 # 老版本 / SDL2 路线
 ```
-
-Eden 侧的 `0002-eden-motion-and-msvc-fixes.patch` 由原来的四个补丁合并而成，内容没有增减：
-
-| 原文件 | 现在的去处 | 作用 |
-|---|---|---|
-| `0002-eden-msvc-static-cast` | 合并进 0002 | MSVC 下 `reinterpret_cast<u64>(ULONG_PTR)` 编译错误（C2440） |
-| `0003-eden-motion-timestamp-reset` | 合并进 0002 | 手柄断连重连后体感静默 |
-| `0004-eden-motion-diagnostics-and-gain` | 合并进 0002 | 体感日志 + 增益 / kp 运行时可调 |
-| `0005-eden-default-gyro-gain` | 合并进 0002 | 陀螺仪增益默认值定为 0.5（北通量程差） |
-
-两个 `0001-sdl*` 不能并进来 —— 它们打的是 **SDL 源码树**（`src/joystick/hidapi/...`），
-而合并补丁打的是 **Eden 源码树**，应用目标和时机都不同。
 
 ## 根因
 
@@ -48,15 +34,6 @@ fGyroScaleX = MULT / (SensCoeffX - RawX) * PI / 180;
    - `sdl_version` 留空 = 3.4.14
 2. 跑完在 Artifacts 下载 `eden-nightly-clangcl-beitong-fix`。
 3. 进游戏后确认体感：Eden 日志里应有 `Controller motion capabilities: accel=1 gyro=1`。
-
-## 已验证（2026-10-27 复核）
-
-| 项 | 结果 |
-|---|---|
-| Eden master `26a03d247`(2026-10-26) | `0002-eden-motion-and-msvc-fixes` `git apply --check` 干净通过 |
-| SDL `release-3.4.8`（Eden cpmfile 里钉的版本） | `0001-sdl3` 干净通过；该函数与 3.4.14 逐字节相同 |
-| SDL `release-3.4.14`（工作流默认） | 同上，行号一致（1125 起） |
-| 最近一次 CI | 2026-10-24 clang-cl 构建成功 |
 
 ## 回弹（大角度运动时明显）—— 已定位并修复
 
