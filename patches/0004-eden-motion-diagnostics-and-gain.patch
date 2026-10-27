@@ -1,0 +1,154 @@
+diff --git a/src/hid_core/frontend/motion_input.cpp b/src/hid_core/frontend/motion_input.cpp
+index 1dcb910a5..bc104ef09 100644
+--- a/src/hid_core/frontend/motion_input.cpp
++++ b/src/hid_core/frontend/motion_input.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cmath>
++#include <cstdlib>
+ #include <numbers>
+ 
+ #include "common/math_util.h"
+@@ -12,9 +13,28 @@
+ 
+ namespace Core::HID {
+ 
++namespace {
++// Tuning hook for controllers whose IMU has no usable factory calibration. A wrong gyro
++// sensitivity makes the accelerometer correction fight the integrated rotation, which is felt as
++// the aim springing back after a large movement. Lowering kp trades that snap back for a slow
++// drift; 0 disables the correction entirely (pure gyro integration). Defaults keep upstream
++// behaviour, so an unset environment changes nothing.
++f32 MotionEnvFloat(const char* name, f32 fallback) {
++    const char* env = std::getenv(name);
++    if (env == nullptr || *env == '\0') {
++        return fallback;
++    }
++    const f32 value = std::strtof(env, nullptr);
++    if (!std::isfinite(value) || value < 0.0f) {
++        return fallback;
++    }
++    return value;
++}
++} // Anonymous namespace
++
+ MotionInput::MotionInput() {
+     // Initialize PID constants with default values
+-    SetPID(0.3f, 0.005f, 0.0f);
++    SetPID(MotionEnvFloat("EDEN_MOTION_KP", 0.3f), MotionEnvFloat("EDEN_MOTION_KI", 0.005f), 0.0f);
+     SetGyroThreshold(ThresholdStandard);
+     ResetQuaternion();
+     ResetRotations();
+diff --git a/src/input_common/drivers/sdl_driver.cpp b/src/input_common/drivers/sdl_driver.cpp
+index c3e9a066b..efe8501ca 100644
+--- a/src/input_common/drivers/sdl_driver.cpp
++++ b/src/input_common/drivers/sdl_driver.cpp
+@@ -4,6 +4,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <array>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
+ #include <numbers>
+ #include "common/logging.h"
+ #include "common/math_util.h"
+@@ -16,6 +19,39 @@
+ namespace InputCommon {
+ 
+ namespace {
++
++// Diagnostics for third party controllers whose IMU has no usable factory calibration.
++// Everything below is opt-in through the environment and is a no-op by default, so a normal
++// build behaves exactly like upstream.
++//
++//   EDEN_MOTION_GYRO_GAIN  multiplies the angular rate coming from SDL. Use it to compensate a
++//                          gyro sensitivity mismatch: if a 90 degree physical rotation only
++//                          produces ~60 degrees of in game rotation the gain is too low.
++//   EDEN_MOTION_LOG        prints one line per second with the raw rate, the gravity vector and
++//                          the integrated rotation, so a sensitivity error can be measured.
++static f32 MotionGyroGain() {
++    static const f32 gain = [] {
++        const char* env = std::getenv("EDEN_MOTION_GYRO_GAIN");
++        if (env == nullptr || *env == '\0') {
++            return 1.0f;
++        }
++        const f32 value = std::strtof(env, nullptr);
++        if (!std::isfinite(value) || value < 0.1f || value > 10.0f) {
++            return 1.0f;
++        }
++        return value;
++    }();
++    return gain;
++}
++
++static bool MotionLogEnabled() {
++    static const bool enabled = [] {
++        const char* env = std::getenv("EDEN_MOTION_LOG");
++        return env != nullptr && *env != '\0' && std::strcmp(env, "0") != 0;
++    }();
++    return enabled;
++}
++
+ Common::UUID GetGUID(SDL_Joystick* joystick) {
+     const SDL_GUID guid = SDL_GetJoystickGUID(joystick);
+     std::array<u8, 16> data{};
+@@ -148,9 +184,18 @@ public:
+             break;
+         }
+         case SDL_SENSOR_GYRO: {
+-            motion.gyro_x = event.data[0] / (f32(std::numbers::pi_v<float>) * 2);
+-            motion.gyro_y = -event.data[2] / (f32(std::numbers::pi_v<float>) * 2);
+-            motion.gyro_z = event.data[1] / (f32(std::numbers::pi_v<float>) * 2);
++            const f32 gain = MotionGyroGain();
++            motion.gyro_x = gain * event.data[0] / (f32(std::numbers::pi_v<float>) * 2);
++            motion.gyro_y = -gain * event.data[2] / (f32(std::numbers::pi_v<float>) * 2);
++            motion.gyro_z = gain * event.data[1] / (f32(std::numbers::pi_v<float>) * 2);
++            if (MotionLogEnabled() && time_difference != 0) {
++                // Signed integral of the rate, in revolutions, so it can be compared directly
++                // against a known physical rotation (a quarter turn shows up as 0.25).
++                const f32 dt = static_cast<f32>(time_difference) * 1.0e-6f;
++                debug_rotation[0] += motion.gyro_x * dt;
++                debug_rotation[1] += motion.gyro_y * dt;
++                debug_rotation[2] += motion.gyro_z * dt;
++            }
+             break;
+         }
+         }
+@@ -174,6 +219,24 @@ public:
+ 
+         motion_error_count = 0;
+         motion.delta_timestamp = time_difference;
++
++        if (MotionLogEnabled() && sensor_timestamp - debug_last_log >= 1'000'000'000ULL) {
++            debug_last_log = sensor_timestamp;
++            LOG_INFO(Input,
++                     "[motion] gain={:.3f} gyro=({:+.3f},{:+.3f},{:+.3f}) "
++                     "accel=({:+.2f},{:+.2f},{:+.2f}) rate={:.1f}deg/s |accel|={:.2f}g "
++                     "turned=({:+.1f},{:+.1f},{:+.1f})deg",
++                     MotionGyroGain(), motion.gyro_x, motion.gyro_y, motion.gyro_z, motion.accel_x,
++                     motion.accel_y, motion.accel_z,
++                     std::sqrt(motion.gyro_x * motion.gyro_x + motion.gyro_y * motion.gyro_y +
++                               motion.gyro_z * motion.gyro_z) *
++                         360.0f,
++                     std::sqrt(motion.accel_x * motion.accel_x + motion.accel_y * motion.accel_y +
++                               motion.accel_z * motion.accel_z),
++                     debug_rotation[0] * 360.0f, debug_rotation[1] * 360.0f,
++                     debug_rotation[2] * 360.0f);
++        }
++
+         return true;
+     }
+ 
+@@ -399,6 +462,10 @@ private:
+     bool has_vibration{false};
+     bool is_vibration_tested{false};
+     BasicMotion motion;
++
++    // Only touched when EDEN_MOTION_LOG is set.
++    Common::Vec<f32, 3> debug_rotation{};
++    u64 debug_last_log{};
+ };
+ 
+ std::shared_ptr<SDLJoystick> SDLDriver::GetSDLJoystickByGUID(const Common::UUID& guid, int port) {
