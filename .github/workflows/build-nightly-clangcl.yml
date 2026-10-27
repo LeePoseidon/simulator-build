@@ -56,8 +56,7 @@ jobs:
         run: |
           $need = @(
             "patches/0001-sdl3-switch-imu-calibration-fallback.patch",
-            "patches/0002-eden-msvc-static-cast.patch",
-            "patches/0004-eden-motion-diagnostics-and-gain.patch"
+            "patches/0002-eden-motion-and-msvc-fixes.patch"
           )
           foreach ($p in $need) {
             if (-not (Test-Path $p)) { throw "缺少补丁文件：$p（请先上传到仓库对应路径）" }
@@ -74,23 +73,26 @@ jobs:
           git clone --depth 1 --branch $ref https://git.eden-emu.dev/eden-emu/eden.git eden
           if ($LASTEXITCODE -ne 0) { throw "克隆 Eden 失败：$ref" }
 
-          # ── 坑位 2：reinterpret_cast<u64>(ULONG_PTR) ──
-          # ExceptionInformation[] 的类型是 ULONG_PTR。MSVC 把 unsigned __int64 与
-          # unsigned long long 当作不同类型，reinterpret_cast 非法 → C2440。
-          # 官方只用 clang 系列构建，所以上游从不报错。这里打 0002 补丁改成 static_cast。
+          # ── 坑位 2 / 14 / 15 / 16 全部收在同一个补丁里 ──
+          # 0002-eden-motion-and-msvc-fixes.patch 是原先 0002+0003+0004+0005 的合并版：
           #
-          # ── 坑位 14：手柄断开重连后体感失效 ──
-          # SDL3 的 sensor_timestamp 来自每个设备上下文的计数器（从 0 开始累加），
-          # 手柄关机重连 = 新上下文 = 时间戳回到 0；而 Eden 的 SDLJoystick 对象在重连时
-          # 被复用、last_motion_update 保留着上一场的高值，于是每帧都被 "时间戳倒退" 判断
-          # 丢弃，体感彻底静默（按键摇杆不受影响）。0003 补丁在重连时重置基线。
-          # 只应用"当前有效"的 Eden 补丁；显式排除已作废的
-          # 0002-eden-allow-sdl2-build-from-source（它只对 SDL2 那条路线有意义，
-          # 拿来打 master 会失败）。新加 0004-eden-*.patch 会被自动带上。
+          #   坑位 2  C2440：ExceptionInformation[] 是 ULONG_PTR，MSVC 把 unsigned __int64
+          #           与 unsigned long long 当作不同类型，reinterpret_cast 非法。改 static_cast。
+          #           官方只用 clang 系列构建，所以上游从不报错。
+          #   坑位 14 重连后体感静默：SDL3 的 sensor_timestamp 来自每个设备上下文的计数器
+          #           （从 0 开始累加），手柄关机重连 = 新上下文 = 时间戳回到 0；而 Eden 的
+          #           SDLJoystick 对象在重连时被复用、last_motion_update 保留着上一场的高值，
+          #           于是每帧都被"时间戳倒退"判断丢弃（按键摇杆不受影响）。
+          #   坑位 15 陀螺仪灵敏度翻倍：克隆手柄 SPI 标定区读回全 0，只能套任天堂原厂系数，
+          #           实测角速度约为真实值的 2 倍 → 俯仰轴大角度回弹。默认增益取 0.5。
+          #   坑位 16 诊断钩子：EDEN_MOTION_LOG / GYRO_GAIN / KP，默认全部中性。
+          #
+          # 合并成一个文件后不再依赖文件名排序，也就不存在"少打一个补丁却全部通过"的情况。
+          # 显式排除已作废的 *allow-sdl2*（只对 SDL2 那条路线有意义，打 master 会失败）。
           $edenPatches = Get-ChildItem -Path "patches" -Filter "*-eden-*.patch" -ErrorAction SilentlyContinue |
                          Where-Object { $_.Name -notlike "*allow-sdl2*" } |
                          Sort-Object Name
-          if (-not $edenPatches) { throw "patches/ 下没找到任何有效 Eden 补丁（至少应有 0002-eden-msvc-static-cast）" }
+          if (-not $edenPatches) { throw "patches/ 下没找到任何有效 Eden 补丁（应有 0002-eden-motion-and-msvc-fixes.patch）" }
           Write-Host "待应用的 Eden 补丁：$($edenPatches.Name -join ', ')"
           foreach ($p in $edenPatches) {
             Write-Host "应用 Eden 补丁：$($p.Name)"
@@ -118,7 +120,17 @@ jobs:
           if (-not (Select-String -Path $sdlDrv -Pattern "1'000'000'000ULL" -Quiet)) {
             throw "0003 补丁未生效：找不到时间戳倒退的容差判断"
           }
-          Write-Host "Eden 补丁已生效（0002 static_cast + 0003 体感时间戳重置）"
+          # ── 自查合并补丁剩余部分：灵敏度默认值 + 诊断钩子必须落进源码 ──
+          if (-not (Select-String -Path $sdlDrv -Pattern "DefaultMotionGyroGain = 0\.5f" -Quiet)) {
+            throw "补丁未生效：sdl_driver.cpp 里找不到 DefaultMotionGyroGain = 0.5f（俯仰回弹会回来）"
+          }
+          if (-not (Select-String -Path $sdlDrv -Pattern "EDEN_MOTION_GYRO_GAIN" -Quiet)) {
+            throw "补丁未生效：sdl_driver.cpp 里找不到 EDEN_MOTION_GYRO_GAIN 调试钩子"
+          }
+          if (-not (Select-String -Path "eden/src/hid_core/frontend/motion_input.cpp" -Pattern "EDEN_MOTION_KP" -Quiet)) {
+            throw "补丁未生效：motion_input.cpp 里找不到 EDEN_MOTION_KP 调试钩子"
+          }
+          Write-Host "Eden 补丁已生效（static_cast + 时间戳重置 + 增益 0.5 + 诊断钩子）"
 
           $commit = (git -C eden rev-parse HEAD).Trim()
           $branch = (git -C eden rev-parse --abbrev-ref HEAD).Trim()

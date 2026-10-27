@@ -1,0 +1,245 @@
+================================================================================
+ Eden 侧合并补丁（原 0002 + 0003 + 0004 + 0005 四合一）
+================================================================================
+ 目标仓库 : https://git.eden-emu.dev/eden-emu/eden
+ 应用方式 : git -C eden apply --verbose 0002-eden-motion-and-msvc-fixes.patch
+ 基准版本 : master 26a03d247 验证通过
+
+ 本补丁只在 eden.exe 侧生效。SDL3 自身的标定除零修复仍由
+ patches/0001-sdl3-switch-imu-calibration-fallback.patch 负责，它打的是
+ SDL 源码树（src/joystick/hidapi/...），与本补丁没有交集，无法合并。
+
+ 包含四处改动，合起来构成「克隆手柄体感不可用」的完整修复链路：
+
+ [1] src/common/sparse_large_vector.cpp
+     reinterpret_cast<u64>(ULONG_PTR) 改为 static_cast。MSVC 下
+     unsigned __int64 与 unsigned long long 属不同类型，reinterpret_cast
+     非法，会以 C2440 编译失败；上游只用 clang，所以官方从不报错。
+     （原 0002-eden-msvc-static-cast）
+
+ [2] src/input_common/drivers/sdl_driver.cpp — 断开重连后体感静默
+     SDL3 的 sensor_timestamp 取自每设备上下文的计数器，手柄重连后回到 0，
+     而 Eden 复用的 SDLJoystick 对象里 last_motion_update 仍是旧的高值，
+     于是每帧都被判为「时间戳倒退」丢弃。此处改为在重连时重置基线。
+     （原 0003-eden-motion-timestamp-reset）
+
+ [3] src/input_common/drivers/sdl_driver.cpp — 陀螺仪灵敏度校准
+     克隆手柄 SPI 标定区读回全 0，只能套用任天堂原厂系数
+     （SWITCH_GYRO_SCALE = 14.2842），实测角速度约为真实值的 2 倍。
+     默认增益取 0.5 后，以加速度计复核 90 度转动的误差在 1% 以内，
+     俯仰轴「大角度回弹」随之消失。
+     （原 0005-eden-default-gyro-gain）
+
+ [4] 诊断与可调钩子（默认中性，不设环境变量时零行为变化）
+       EDEN_MOTION_LOG=1        每秒输出一行 [motion]，含 gyro/accel/turned
+       EDEN_MOTION_GYRO_GAIN=x  覆盖默认增益 0.5（设 1 回到上游行为，
+                                换正品 Pro Controller 时需要）
+       EDEN_MOTION_KP=x         加速度计回正强度，默认 0.3，0 = 纯积分
+     （原 0004-eden-motion-diagnostics-and-gain）
+
+ 已逐字节验证：应用本补丁后的三个文件，与依次应用原 0002/0003/0004/0005
+ 的结果 sha1 完全一致，不存在合并引入的行为差异。
+================================================================================
+
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index eee8ff6d1..74345b17a 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -26,7 +26,9 @@ static std::mutex vector_regions_mutex {};
+ // Workaround for handling non-commited memory accessed by Dynarmic; usually result of an error
+ static LONG WINAPI FakePageFaultHandler(PEXCEPTION_POINTERS info) {
+     DWORD code = info->ExceptionRecord->ExceptionCode;
+-    u64 exception_addr = reinterpret_cast<u64>(info->ExceptionRecord->ExceptionInformation[1]);
++    // ExceptionInformation[] is ULONG_PTR, which MSVC treats as a distinct type from
++    // unsigned long long (u64), so reinterpret_cast between the two is ill-formed there.
++    u64 exception_addr = static_cast<u64>(info->ExceptionRecord->ExceptionInformation[1]);
+ 
+     if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->ExceptionInformation[0] == 1) {
+         // Not our problem
+diff --git a/src/hid_core/frontend/motion_input.cpp b/src/hid_core/frontend/motion_input.cpp
+index 1dcb910a5..bc104ef09 100644
+--- a/src/hid_core/frontend/motion_input.cpp
++++ b/src/hid_core/frontend/motion_input.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cmath>
++#include <cstdlib>
+ #include <numbers>
+ 
+ #include "common/math_util.h"
+@@ -12,9 +13,28 @@
+ 
+ namespace Core::HID {
+ 
++namespace {
++// Tuning hook for controllers whose IMU has no usable factory calibration. A wrong gyro
++// sensitivity makes the accelerometer correction fight the integrated rotation, which is felt as
++// the aim springing back after a large movement. Lowering kp trades that snap back for a slow
++// drift; 0 disables the correction entirely (pure gyro integration). Defaults keep upstream
++// behaviour, so an unset environment changes nothing.
++f32 MotionEnvFloat(const char* name, f32 fallback) {
++    const char* env = std::getenv(name);
++    if (env == nullptr || *env == '\0') {
++        return fallback;
++    }
++    const f32 value = std::strtof(env, nullptr);
++    if (!std::isfinite(value) || value < 0.0f) {
++        return fallback;
++    }
++    return value;
++}
++} // Anonymous namespace
++
+ MotionInput::MotionInput() {
+     // Initialize PID constants with default values
+-    SetPID(0.3f, 0.005f, 0.0f);
++    SetPID(MotionEnvFloat("EDEN_MOTION_KP", 0.3f), MotionEnvFloat("EDEN_MOTION_KI", 0.005f), 0.0f);
+     SetGyroThreshold(ThresholdStandard);
+     ResetQuaternion();
+     ResetRotations();
+diff --git a/src/input_common/drivers/sdl_driver.cpp b/src/input_common/drivers/sdl_driver.cpp
+index c3e9a066b..7d26b157a 100644
+--- a/src/input_common/drivers/sdl_driver.cpp
++++ b/src/input_common/drivers/sdl_driver.cpp
+@@ -4,6 +4,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <array>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
+ #include <numbers>
+ #include "common/logging.h"
+ #include "common/math_util.h"
+@@ -16,6 +19,44 @@
+ namespace InputCommon {
+ 
+ namespace {
++
++// Beitong and similar Pro Controller clones report roughly twice the real angular velocity:
++// their IMU is configured for half the full scale range Nintendo uses, so the same physical
++// rotation produces twice the raw counts while we convert it with Nintendo's coefficients.
++// Measured on a Beitong pad: 65 degrees of physical pitch came through as 130 degrees of gyro
++// integration. That made the accelerometer correction fight the integrated attitude and drag it
++// back after large movements (the "snap back" on pitch, while yaw was unaffected because gravity
++// cannot observe yaw). Halving the rate makes both agree again (measured 1.00 against the
++// accelerometer afterwards).
++//
++//   EDEN_MOTION_GYRO_GAIN  overrides the default below; 1.0 gives the unscaled SDL rate
++//   EDEN_MOTION_LOG        prints one line per second with the raw rate, the gravity vector and
++//                          the integrated rotation, so a sensitivity error can be measured
++static constexpr f32 DefaultMotionGyroGain = 0.5f;
++
++static f32 MotionGyroGain() {
++    static const f32 gain = [] {
++        const char* env = std::getenv("EDEN_MOTION_GYRO_GAIN");
++        if (env == nullptr || *env == '\0') {
++            return DefaultMotionGyroGain;
++        }
++        const f32 value = std::strtof(env, nullptr);
++        if (!std::isfinite(value) || value < 0.1f || value > 10.0f) {
++            return DefaultMotionGyroGain;
++        }
++        return value;
++    }();
++    return gain;
++}
++
++static bool MotionLogEnabled() {
++    static const bool enabled = [] {
++        const char* env = std::getenv("EDEN_MOTION_LOG");
++        return env != nullptr && *env != '\0' && std::strcmp(env, "0") != 0;
++    }();
++    return enabled;
++}
++
+ Common::UUID GetGUID(SDL_Joystick* joystick) {
+     const SDL_GUID guid = SDL_GetJoystickGUID(joystick);
+     std::array<u8, 16> data{};
+@@ -133,6 +174,13 @@ public:
+             return false;
+         }
+         if (sensor_timestamp < last_motion_update) {
++            // A large backwards jump means the driver restarted its timestamp domain
++            // (device reopen) rather than a single out-of-order sample, so rebase instead
++            // of discarding motion input for the rest of the session.
++            if (last_motion_update - sensor_timestamp > 1'000'000'000ULL) {
++                last_motion_update = sensor_timestamp;
++                motion_error_count = 0;
++            }
+             return false;
+         }
+ 
+@@ -148,9 +196,18 @@ public:
+             break;
+         }
+         case SDL_SENSOR_GYRO: {
+-            motion.gyro_x = event.data[0] / (f32(std::numbers::pi_v<float>) * 2);
+-            motion.gyro_y = -event.data[2] / (f32(std::numbers::pi_v<float>) * 2);
+-            motion.gyro_z = event.data[1] / (f32(std::numbers::pi_v<float>) * 2);
++            const f32 gain = MotionGyroGain();
++            motion.gyro_x = gain * event.data[0] / (f32(std::numbers::pi_v<float>) * 2);
++            motion.gyro_y = -gain * event.data[2] / (f32(std::numbers::pi_v<float>) * 2);
++            motion.gyro_z = gain * event.data[1] / (f32(std::numbers::pi_v<float>) * 2);
++            if (MotionLogEnabled() && time_difference != 0) {
++                // Signed integral of the rate, in revolutions, so it can be compared directly
++                // against a known physical rotation (a quarter turn shows up as 0.25).
++                const f32 dt = static_cast<f32>(time_difference) * 1.0e-6f;
++                debug_rotation[0] += motion.gyro_x * dt;
++                debug_rotation[1] += motion.gyro_y * dt;
++                debug_rotation[2] += motion.gyro_z * dt;
++            }
+             break;
+         }
+         }
+@@ -174,6 +231,24 @@ public:
+ 
+         motion_error_count = 0;
+         motion.delta_timestamp = time_difference;
++
++        if (MotionLogEnabled() && sensor_timestamp - debug_last_log >= 1'000'000'000ULL) {
++            debug_last_log = sensor_timestamp;
++            LOG_INFO(Input,
++                     "[motion] gain={:.3f} gyro=({:+.3f},{:+.3f},{:+.3f}) "
++                     "accel=({:+.2f},{:+.2f},{:+.2f}) rate={:.1f}deg/s |accel|={:.2f}g "
++                     "turned=({:+.1f},{:+.1f},{:+.1f})deg",
++                     MotionGyroGain(), motion.gyro_x, motion.gyro_y, motion.gyro_z, motion.accel_x,
++                     motion.accel_y, motion.accel_z,
++                     std::sqrt(motion.gyro_x * motion.gyro_x + motion.gyro_y * motion.gyro_y +
++                               motion.gyro_z * motion.gyro_z) *
++                         360.0f,
++                     std::sqrt(motion.accel_x * motion.accel_x + motion.accel_y * motion.accel_y +
++                               motion.accel_z * motion.accel_z),
++                     debug_rotation[0] * 360.0f, debug_rotation[1] * 360.0f,
++                     debug_rotation[2] * 360.0f);
++        }
++
+         return true;
+     }
+ 
+@@ -294,6 +369,13 @@ public:
+     void SetSDLJoystick(SDL_Joystick* joystick, SDL_Gamepad* controller) {
+         sdl_joystick.reset(joystick);
+         sdl_controller.reset(controller);
++        // SDL3 derives sensor timestamps from a counter that restarts at zero for every
++        // device open, so a controller that is powered off and reconnected comes back with
++        // timestamps far behind the ones of the previous session. Keeping the old baseline
++        // would make every following sample look like it went backwards and be dropped
++        // forever, which silently kills motion input until the emulator is restarted.
++        last_motion_update = 0;
++        motion_error_count = 0;
+     }
+ 
+     bool IsJoyconLeft() const {
+@@ -399,6 +481,10 @@ private:
+     bool has_vibration{false};
+     bool is_vibration_tested{false};
+     BasicMotion motion;
++
++    // Only touched when EDEN_MOTION_LOG is set.
++    Common::Vec<f32, 3> debug_rotation{};
++    u64 debug_last_log{};
+ };
+ 
+ std::shared_ptr<SDLJoystick> SDLDriver::GetSDLJoystickByGUID(const Common::UUID& guid, int port) {

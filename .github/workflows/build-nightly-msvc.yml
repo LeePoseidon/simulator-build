@@ -50,8 +50,7 @@ jobs:
         run: |
           $need = @(
             "patches/0001-sdl3-switch-imu-calibration-fallback.patch",
-            "patches/0002-eden-msvc-static-cast.patch",
-            "patches/0004-eden-motion-diagnostics-and-gain.patch"
+            "patches/0002-eden-motion-and-msvc-fixes.patch"
           )
           foreach ($p in $need) {
             if (-not (Test-Path $p)) { throw "缺少补丁文件：$p（请先上传到仓库对应路径）" }
@@ -68,11 +67,18 @@ jobs:
           git clone --depth 1 --branch $ref https://git.eden-emu.dev/eden-emu/eden.git eden
           if ($LASTEXITCODE -ne 0) { throw "克隆 Eden 失败：$ref" }
 
-          # ── 坑位 2：C2440 ──
-          # ExceptionInformation[] 的类型是 ULONG_PTR。MSVC 把 unsigned __int64 与
-          # unsigned long long 当作不同类型，reinterpret_cast 非法。改成 static_cast。
-          $edenPatches = Get-ChildItem -Path "patches" -Filter "0002-eden-msvc-*.patch" -ErrorAction SilentlyContinue
-          if (-not $edenPatches) { throw "没找到 0002-eden-msvc-*.patch" }
+          # ── 坑位 2 / 14 / 15 / 16 收在同一个补丁里 ──
+          # 0002-eden-motion-and-msvc-fixes.patch = 原 0002+0003+0004+0005 合并版：
+          #   C2440 编译修复、重连体感重置、陀螺仪默认增益 0.5、诊断钩子。
+          #
+          # 注意：这里原先是 -Filter "0002-eden-msvc-*.patch"，只匹配编译修复那一个文件，
+          # 于是本条路线产出的包一直没有体感修复（俯仰回弹、重连失效都在），却在
+          # 前置检查和"补丁已生效"两处都显示通过 —— 典型的假成功。现统一成 *-eden-*。
+          $edenPatches = Get-ChildItem -Path "patches" -Filter "*-eden-*.patch" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -notlike "*allow-sdl2*" } |
+                         Sort-Object Name
+          if (-not $edenPatches) { throw "patches/ 下没找到 Eden 补丁（应有 0002-eden-motion-and-msvc-fixes.patch）" }
+          Write-Host "待应用的 Eden 补丁：$($edenPatches.Name -join ', ')"
           foreach ($p in $edenPatches) {
             Write-Host "应用 Eden 补丁：$($p.Name)"
             git -c core.autocrlf=false -C eden apply --verbose $p.FullName
@@ -88,7 +94,18 @@ jobs:
           if (Select-String -Path "eden/src/common/sparse_large_vector.cpp" -Pattern "reinterpret_cast<u64>\(info->ExceptionRecord" -Quiet) {
             throw "Eden 补丁未生效：旧的 reinterpret_cast<u64> 仍在"
           }
-          Write-Host "Eden 补丁已生效"
+          $sdlDrv = "eden/src/input_common/drivers/sdl_driver.cpp"
+          foreach ($pair in @(
+              @{ File = $sdlDrv; Pattern = "last_motion_update = 0;"; Why = "重连后体感仍会失效" },
+              @{ File = $sdlDrv; Pattern = "DefaultMotionGyroGain = 0\.5f"; Why = "俯仰回弹会回来" },
+              @{ File = $sdlDrv; Pattern = "EDEN_MOTION_GYRO_GAIN"; Why = "诊断钩子缺失" },
+              @{ File = "eden/src/hid_core/frontend/motion_input.cpp"; Pattern = "EDEN_MOTION_KP"; Why = "诊断钩子缺失" }
+            )) {
+            if (-not (Select-String -Path $pair.File -Pattern $pair.Pattern -Quiet)) {
+              throw "Eden 补丁未生效：$($pair.File) 里找不到 $($pair.Pattern)（$($pair.Why)）"
+            }
+          }
+          Write-Host "Eden 补丁已生效（static_cast + 时间戳重置 + 增益 0.5 + 诊断钩子）"
 
           $commit = (git -C eden rev-parse HEAD).Trim()
           $branch = (git -C eden rev-parse --abbrev-ref HEAD).Trim()
