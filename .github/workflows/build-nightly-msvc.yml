@@ -50,7 +50,8 @@ jobs:
         run: |
           $need = @(
             "patches/0001-sdl3-switch-imu-calibration-fallback.patch",
-            "patches/0002-eden-msvc-static-cast.patch"
+            "patches/0002-eden-msvc-static-cast.patch",
+            "patches/0004-eden-motion-diagnostics-and-gain.patch"
           )
           foreach ($p in $need) {
             if (-not (Test-Path $p)) { throw "缺少补丁文件：$p（请先上传到仓库对应路径）" }
@@ -250,6 +251,11 @@ jobs:
             "-DENABLE_QT=ON",
             "-DYUZU_USE_BUNDLED_SDL3=OFF",
             "-DSDL3_CUSTOM_DIR=$root/sdl3",
+            # 坑位 15：AddPackage 里先 find_package(SDL3 3.2.10) 再判断 *_CUSTOM_DIR。
+            # runner 上万一存在系统 SDL3（或以后 base image 自带），就会静默走系统库，
+            # SDL3_CUSTOM_DIR 被忽略 → 打好的体感补丁不进二进制，而构建依然显示成功。
+            # 显式强制 bundled，保证编的永远是我们修补过的那份源码。
+            "-DSDL3_FORCE_BUNDLED=ON",
             "-DSDL_SHARED=OFF","-DSDL_STATIC=ON",
             "-DSDL_TESTS=OFF","-DSDL_TEST_LIBRARY=OFF",
             # 下面一步会直接修改生成的 ninja 文件（清洗第三方依赖带进来的 /we####）。
@@ -346,8 +352,13 @@ jobs:
           }
 
           $cache = Get-Content build/CMakeCache.txt -Raw
-          if ($cache -notmatch 'SDL3_CUSTOM_DIR') { throw "CMakeCache 里没有 SDL3_CUSTOM_DIR" }
-          Select-String -Path build/CMakeCache.txt -Pattern '^SDL3_CUSTOM_DIR|^YUZU_USE_BUNDLED_SDL3|^SDL_SHARED|^SDL_STATIC|^ENABLE_QT_TRANSLATION' |
+          if ($cache -notmatch '(?m)^SDL3_CUSTOM_DIR:.*sdl3') {
+            throw "CMakeCache 里没有指向 sdl3/ 的 SDL3_CUSTOM_DIR（SDL 补丁不会进二进制）"
+          }
+          if ($cache -notmatch '(?m)^SDL3_FORCE_BUNDLED:BOOL=ON') {
+            throw "SDL3_FORCE_BUNDLED 不是 ON：可能选中了系统 SDL3，体感补丁会被静默忽略"
+          }
+          Select-String -Path build/CMakeCache.txt -Pattern '^SDL3_CUSTOM_DIR|^SDL3_FORCE_BUNDLED|^YUZU_USE_BUNDLED_SDL3|^SDL_SHARED|^SDL_STATIC|^ENABLE_QT_TRANSLATION' |
             ForEach-Object { Write-Host $_.Line }
 
           $qrc = Get-ChildItem -Recurse build -Filter "languages.qrc" -ErrorAction SilentlyContinue | Select-Object -First 1
